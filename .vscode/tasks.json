@@ -1,0 +1,23 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Mod DLL",
+            "type": "shell",
+            "command": "cl.exe",
+            "args": [
+                "/EHsc",           // Enable C++ exceptions
+                "/LD",             // Create a DLL
+                "/std:c++17",      // Use C++17 standard
+                "/O2",             // Optimize for speed
+                "dllmain.cpp",     // Input file (includes others)
+                "/Fe:main.dll"     // Output filename
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$msCompile"
+        }
+    ]
+}
