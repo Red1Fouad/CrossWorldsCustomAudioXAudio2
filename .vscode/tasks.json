@@ -9,6 +9,7 @@
                 "/EHsc",           // Enable C++ exceptions
                 "/LD",             // Create a DLL
                 "/std:c++17",      // Use C++17 standard
+                "/MD",             // Use Multi-threaded DLL Runtime (matches MinHook-md)
                 "/O2",             // Optimize for speed
                 "dllmain.cpp",     // Input file (includes others)
                 "/Fe:main.dll"     // Output filename
