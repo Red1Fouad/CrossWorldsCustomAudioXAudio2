@@ -22,7 +22,12 @@ HMODULE g_hModule = nullptr;
 
 // Map to store Cue Names for Players
 std::map<void*, std::string> g_playerCueNames;
+std::map<void*, int> g_playerCategoryIds;
 std::mutex g_playerMutex;
+
+// Global Audio Engine access for the hooks
+AudioEngine* g_audio = nullptr;
+std::string g_soundPath;
 
 // --- Pattern Scanning & Hooking Helpers ---
 
@@ -93,36 +98,63 @@ void Hook_SetCueName(void* player, void* acb, const char* cueName) {
     if (fpSetCueNameOriginal) fpSetCueNameOriginal(player, acb, cueName);
 }
 
+// Hook SetCategoryById to track which category a player belongs to
+typedef void (*criAtomExPlayer_SetCategoryById_t)(void* player, int id);
+criAtomExPlayer_SetCategoryById_t fpSetCategoryByIdOriginal = nullptr;
+
+void Hook_SetCategoryById(void* player, int id) {
+    {
+        std::lock_guard<std::mutex> lock(g_playerMutex);
+        g_playerCategoryIds[player] = id;
+    }
+    if (fpSetCategoryByIdOriginal) fpSetCategoryByIdOriginal(player, id);
+}
+
+// Hook Category SetVolume to see when game changes category volumes
+typedef void (*criAtomExCategory_SetVolume_t)(int id, float vol);
+criAtomExCategory_SetVolume_t fpCategorySetVolumeOriginal = nullptr;
+
+void Hook_CategorySetVolume(int id, float vol) {
+    std::cout << "[Mod] CRI Category SetVolume(" << id << ") -> " << vol << std::endl;
+    if (fpCategorySetVolumeOriginal) fpCategorySetVolumeOriginal(id, vol);
+}
+
 // Hook Start: This is where the sound actually plays
 typedef uint32_t (*criAtomExPlayer_Start_t)(void* player);
 criAtomExPlayer_Start_t fpStartOriginal = nullptr;
 
+// We need the GetVolume function pointer to call it manually
+typedef float (*criAtomExCategory_GetVolume_t)(int id);
+criAtomExCategory_GetVolume_t fpCategoryGetVolume = nullptr;
+
 uint32_t Hook_Start(void* player) {
     std::string name = "Unknown";
+    int catId = -1;
     {
         std::lock_guard<std::mutex> lock(g_playerMutex);
         if (g_playerCueNames.count(player)) {
             name = g_playerCueNames[player];
         }
+        if (g_playerCategoryIds.count(player)) {
+            catId = g_playerCategoryIds[player];
+        }
     }
     
-    std::cout << "[Mod] CRI Start Playing -> Cue: " << name << std::endl;
+    std::stringstream ss;
+    ss << "[Mod] CRI Start -> Cue: " << name;
+
+    if (fpCategoryGetVolume) {
+        if (catId != -1) ss << " | PlayerCat(" << catId << "): " << fpCategoryGetVolume(catId);
+        
+        // Scan first few categories to find Voice (usually 0-5)
+        ss << " | AllCats: ";
+        for (int i = 0; i < 6; ++i) ss << "[" << i << "]:" << fpCategoryGetVolume(i) << " ";
+    }
+
+    std::cout << ss.str() << std::endl;
 
     if (fpStartOriginal) return fpStartOriginal(player);
     return 0;
-}
-
-// Hook Category GetVolume (VolumeTest)
-typedef float (*criAtomExCategory_GetVolume_t)(int id);
-criAtomExCategory_GetVolume_t fpCategoryGetVolumeOriginal = nullptr;
-
-float Hook_CategoryGetVolume(int id) {
-    float vol = 0.0f;
-    if (fpCategoryGetVolumeOriginal) vol = fpCategoryGetVolumeOriginal(id);
-    
-    // Log it
-    std::cout << "[Mod] CRI Category GetVolume(" << id << ") -> " << vol << std::endl;
-    return vol;
 }
 
 void InitHooks() {
@@ -150,6 +182,28 @@ void InitHooks() {
         std::cout << "[Mod] Failed to find signature for criAtomExPlayer_SetCueName.\n";
     }
 
+    // SetCategoryById
+    const char* sigSetCat = "48 89 5C 24 ?? 48 89 6C 24 ?? 48 89 74 24 ?? 57 48 83 EC 50 48 8B D9 8B FA";
+    uintptr_t addrSetCat = PatternScan(hGame, sigSetCat);
+    if (addrSetCat) {
+        std::cout << "[Mod] Found criAtomExPlayer_SetCategoryById at: " << (void*)addrSetCat << std::endl;
+        MH_CreateHook((void*)addrSetCat, &Hook_SetCategoryById, (void**)&fpSetCategoryByIdOriginal);
+        MH_EnableHook((void*)addrSetCat);
+    } else {
+        std::cout << "[Mod] Failed to find signature for criAtomExPlayer_SetCategoryById.\n";
+    }
+
+    // Category SetVolume
+    const char* sigCatSetVol = "40 53 48 83 EC 30 48 0F BF D9";
+    uintptr_t addrCatSetVol = PatternScan(hGame, sigCatSetVol);
+    if (addrCatSetVol) {
+        std::cout << "[Mod] Found criAtomExCategory_SetVolume at: " << (void*)addrCatSetVol << std::endl;
+        MH_CreateHook((void*)addrCatSetVol, &Hook_CategorySetVolume, (void**)&fpCategorySetVolumeOriginal);
+        MH_EnableHook((void*)addrCatSetVol);
+    } else {
+        std::cout << "[Mod] Failed to find signature for criAtomExCategory_SetVolume.\n";
+    }
+
     // Start
     const char* sigStart = "48 89 5C 24 ?? 57 48 83 EC 20 48 8B F9 48 85 C9 75 ?? 44 8D 41 ?? 48 8D 15 ?? ?? ?? ?? E8 ?? ?? ?? ?? 83 C8 FF";
     uintptr_t addrStart = PatternScan(hGame, sigStart);
@@ -162,14 +216,12 @@ void InitHooks() {
         std::cout << "[Mod] Failed to find signature for criAtomExPlayer_Start.\n";
     }
 
-    // Category GetVolume
+    // Category GetVolume (Just get address, don't hook)
     const char* sigCatVol = "40 53 48 83 EC 20 83 64 24 ?? 00";
     uintptr_t addrCatVol = PatternScan(hGame, sigCatVol);
     if (addrCatVol) {
         std::cout << "[Mod] Found criAtomExCategory_GetVolume at: " << (void*)addrCatVol << std::endl;
-        MH_CreateHook((void*)addrCatVol, &Hook_CategoryGetVolume, (void**)&fpCategoryGetVolumeOriginal);
-        MH_EnableHook((void*)addrCatVol);
-        std::cout << "[Mod] CategoryGetVolume Hook enabled!\n";
+        fpCategoryGetVolume = (criAtomExCategory_GetVolume_t)addrCatVol;
     } else {
         std::cout << "[Mod] Failed to find signature for criAtomExCategory_GetVolume.\n";
     }
@@ -177,20 +229,19 @@ void InitHooks() {
 
 // The background worker thread
 void InputLoop() {
+    // Initialize AudioEngine on this thread's stack, but expose it globally
     AudioEngine audio;
     if (!audio.Init()) {
         MessageBoxA(nullptr, "Failed to Init XAudio2", "Mod Error", MB_OK);
         return;
     }
+    g_audio = &audio;
 
     // Create a console window to see the logs
     AllocConsole();
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
     freopen_s(&f, "CONOUT$", "w", stderr);
-
-    // Initialize our hooks
-    InitHooks();
 
     // Get the directory of the current DLL so we can load the wav from next to it
     char pathBuffer[MAX_PATH];
@@ -205,13 +256,16 @@ void InputLoop() {
         dllDir = dllDir.substr(0, lastSlash);
     }
 
-    std::string soundPath = dllDir + "\\test.wav";
+    g_soundPath = dllDir + "\\test.wav";
 
-    if (GetFileAttributesA(soundPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        std::cout << "[Mod] Sound file found at: " << soundPath << std::endl;
+    if (GetFileAttributesA(g_soundPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        std::cout << "[Mod] Sound file found at: " << g_soundPath << std::endl;
     } else {
-        std::cout << "[Mod] ERROR: test.wav not found next to DLL! Expected at: " << soundPath << std::endl;
+        std::cout << "[Mod] ERROR: test.wav not found next to DLL! Expected at: " << g_soundPath << std::endl;
     }
+
+    // Initialize hooks AFTER setting up audio and paths
+    InitHooks();
 
     bool wasPressed = false;
 
@@ -222,7 +276,7 @@ void InputLoop() {
 
         if (isPressed && !wasPressed) {
             // Key Down Event
-            audio.PlayWave(soundPath);
+            audio.PlayWave(g_soundPath);
         }
 
         wasPressed = isPressed;
@@ -230,6 +284,9 @@ void InputLoop() {
         // Sleep to prevent high CPU usage in this thread
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+
+    // Clear global pointer before exiting
+    g_audio = nullptr;
 }
 
 extern "C" __declspec(dllexport) void start_mod() {
