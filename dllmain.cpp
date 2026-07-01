@@ -1,35 +1,41 @@
+#define NOMINMAX
 #include <windows.h>
+#define DR_MP3_IMPLEMENTATION
+#define DR_FLAC_IMPLEMENTATION
 #include <thread>
 #include <atomic>
 #include <iostream>
 #include <cstdio>
-#include <vector>
 #include <sstream>
+#include <vector>
 #include <psapi.h>
 #include <map>
 #include <mutex>
+#include <random>
 #include "AudioEngine.h"
 #include "MinHook.h"
 
-// Link against User32.lib for MessageBox and Input
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "libMinHook-x64-v141-md.lib")
 
-// Global atomic to control the thread
 std::atomic<bool> bIsRunning{ false };
 HMODULE g_hModule = nullptr;
 
-// Map to store Cue Names for Players
 std::map<void*, std::string> g_playerCueNames;
 std::map<void*, int> g_playerCategoryIds;
+std::map<void*, std::string> g_acbFiles;
+std::map<void*, std::string> g_playerAcbFiles;
 std::mutex g_playerMutex;
 
-// Global Audio Engine access for the hooks
 AudioEngine* g_audio = nullptr;
-std::string g_soundPath;
-
-// --- Pattern Scanning & Hooking Helpers ---
+std::vector<std::string> g_soundPaths;
+std::vector<WavData> g_preloadedSounds;
+std::atomic<bool> g_playedFinish{ false };
+bool g_playNewMusic = false;
+float g_customBgmVolume = 1.0f;
+float g_originalBgmVolume = 1.0f;
+std::mt19937 g_rng(std::random_device{}());
 
 std::vector<int> ParseSignature(const std::string& signature) {
     std::vector<int> bytes;
@@ -64,14 +70,6 @@ uintptr_t PatternScan(HMODULE hModule, const std::string& signature) {
     return 0;
 }
 
-// --- Hooks ---
-
-// Signature provided: 48 89 5C 24 ?? 48 89 6C 24 ?? 56 57 41 56 48 83 EC 20 45 33 F6 49 8B F0
-// The ending 'mov rsi, r8' implies R8 (3rd arg) is important. Likely SetCueName(player, acb, name).
-typedef void (*criAtomExPlayer_SetCueName_t)(void* player, void* acb, const char* cueName);
-criAtomExPlayer_SetCueName_t fpSetCueNameOriginal = nullptr;
-
-// Helper to safely read the string without triggering C2712 (SEH + C++ Unwinding conflict)
 bool SafeReadString(const char* src, char* dest, size_t maxLen) {
     __try {
         if (!src) return false;
@@ -79,26 +77,31 @@ bool SafeReadString(const char* src, char* dest, size_t maxLen) {
             dest[i] = src[i];
             if (src[i] == '\0') return true;
         }
-        dest[maxLen - 1] = '\0'; // Force null termination
+        dest[maxLen - 1] = '\0';
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 }
 
+typedef void (*criAtomExPlayer_SetCueName_t)(void* player, void* acb, const char* cueName);
+criAtomExPlayer_SetCueName_t fpSetCueNameOriginal = nullptr;
+
 void Hook_SetCueName(void* player, void* acb, const char* cueName) {
     char safeName[256];
     if (SafeReadString(cueName, safeName, sizeof(safeName))) {
         std::lock_guard<std::mutex> lock(g_playerMutex);
         g_playerCueNames[player] = safeName;
-        std::cout << "[Mod] CRI SetCueName: " << safeName << " (Player: " << player << ")" << std::endl;
+        if (g_acbFiles.count(acb))
+            g_playerAcbFiles[player] = g_acbFiles[acb];
+        else
+            g_playerAcbFiles[player] = "Unknown (Memory/Data)";
+        if (strncmp(safeName, "BGM_", 4) == 0 || strncmp(safeName, "SE_FINISH", 9) == 0)
+            std::cout << "[Mod] CRI SetCueName: " << safeName << std::endl;
     }
-
-    // Call original
     if (fpSetCueNameOriginal) fpSetCueNameOriginal(player, acb, cueName);
 }
 
-// Hook SetCategoryById to track which category a player belongs to
 typedef void (*criAtomExPlayer_SetCategoryById_t)(void* player, int id);
 criAtomExPlayer_SetCategoryById_t fpSetCategoryByIdOriginal = nullptr;
 
@@ -110,67 +113,107 @@ void Hook_SetCategoryById(void* player, int id) {
     if (fpSetCategoryByIdOriginal) fpSetCategoryByIdOriginal(player, id);
 }
 
-// Hook Category SetVolume to see when game changes category volumes
-typedef void (*criAtomExCategory_SetVolume_t)(int id, float vol);
-criAtomExCategory_SetVolume_t fpCategorySetVolumeOriginal = nullptr;
+typedef void* (*criAtomExAcb_LoadAcbFile_t)(void* acbLib, const char* path, void* work, int workSize, void* buff, int buffSize);
+criAtomExAcb_LoadAcbFile_t fpLoadAcbFileOriginal = nullptr;
 
-void Hook_CategorySetVolume(int id, float vol) {
-    std::cout << "[Mod] CRI Category SetVolume(" << id << ") -> " << vol << std::endl;
-    if (fpCategorySetVolumeOriginal) fpCategorySetVolumeOriginal(id, vol);
+void* Hook_LoadAcbFile(void* acbLib, const char* path, void* work, int workSize, void* buff, int buffSize) {
+    void* ret = fpLoadAcbFileOriginal(acbLib, path, work, workSize, buff, buffSize);
+    if (ret && path) {
+        std::lock_guard<std::mutex> lock(g_playerMutex);
+        g_acbFiles[ret] = path;
+    }
+    return ret;
 }
 
-// Hook Start: This is where the sound actually plays
-typedef uint32_t (*criAtomExPlayer_Start_t)(void* player);
-criAtomExPlayer_Start_t fpStartOriginal = nullptr;
-
-// We need the GetVolume function pointer to call it manually
+// Direct function addresses (not hooked)
+typedef void (*criAtomExCategory_SetVolume_t)(int id, float vol);
+criAtomExCategory_SetVolume_t fpCategorySetVolume = nullptr;
 typedef float (*criAtomExCategory_GetVolume_t)(int id);
 criAtomExCategory_GetVolume_t fpCategoryGetVolume = nullptr;
 
+typedef uint32_t (*criAtomExPlayer_Start_t)(void* player);
+criAtomExPlayer_Start_t fpStartOriginal = nullptr;
+
 uint32_t Hook_Start(void* player) {
     std::string name = "Unknown";
+    std::string acbFile = "";
     int catId = -1;
     {
         std::lock_guard<std::mutex> lock(g_playerMutex);
-        if (g_playerCueNames.count(player)) {
+        if (g_playerCueNames.count(player))
             name = g_playerCueNames[player];
-        }
-        if (g_playerCategoryIds.count(player)) {
+        if (g_playerCategoryIds.count(player))
             catId = g_playerCategoryIds[player];
+        if (g_playerAcbFiles.count(player))
+            acbFile = g_playerAcbFiles[player];
+    }
+
+    if (name.find("SE_FINISH") == 0 || name.find("BGM_") == 0) {
+        std::stringstream ss;
+        ss << "[Mod] CRI Start -> Cue: " << name;
+        if (!acbFile.empty()) ss << " | ACB: " << acbFile;
+        if (fpCategoryGetVolume) {
+            if (catId != -1) ss << " | PlayerCat(" << catId << "): " << fpCategoryGetVolume(catId);
+            ss << " | Cats:";
+            for (int i = 0; i < 16; ++i) ss << " [" << i << "]:" << fpCategoryGetVolume(i);
+        }
+        std::cout << ss.str() << std::endl;
+    }
+
+    if (name.find("SE_FINISH") == 0) {
+        bool expected = false;
+        if (g_playedFinish.compare_exchange_strong(expected, true)) {
+            if (g_audio) g_audio->StopCategory(0);
+            if (fpCategorySetVolume) fpCategorySetVolume(0, g_originalBgmVolume);
+            std::cout << "[Mod] Stopped custom BGM, restored cat 0 to " << g_originalBgmVolume << std::endl;
         }
     }
-    
-    std::stringstream ss;
-    ss << "[Mod] CRI Start -> Cue: " << name;
 
-    if (fpCategoryGetVolume) {
-        if (catId != -1) ss << " | PlayerCat(" << catId << "): " << fpCategoryGetVolume(catId);
-        
-        // Scan first few categories to find Voice (usually 0-5)
-        ss << " | AllCats: ";
-        for (int i = 0; i < 6; ++i) ss << "[" << i << "]:" << fpCategoryGetVolume(i) << " ";
+    if (name.find("BGM_") == 0) {
+        if (name == "BGM_MONSTERTRUCK_01") {
+            return 0;
+        }
+
+        auto isGpFinal = [&]() -> bool {
+            const std::string p = "BGM_GP_";
+            const std::string s = "_FINAL_1_2";
+            if (name.size() <= p.size() + s.size()) return false;
+            if (name.find(p) != 0) return false;
+            if (name.rfind(s) != name.size() - s.size()) return false;
+            for (size_t i = p.size(); i < name.size() - s.size(); i++)
+                if (!isdigit((unsigned char)name[i])) return false;
+            return true;
+        };
+        bool isCustomBgm = (name == "BGM_LAP1" || name == "BGM_LAP2_FORCE" || isGpFinal());
+
+        if (!isCustomBgm && fpCategorySetVolume)
+            fpCategorySetVolume(0, g_originalBgmVolume);
+
+        if (g_audio) g_audio->StopCategory(0);
+
+        if (isCustomBgm && !g_preloadedSounds.empty()) {
+            g_playedFinish.store(false);
+            if (fpCategoryGetVolume) g_originalBgmVolume = fpCategoryGetVolume(0);
+            if (fpCategorySetVolume) fpCategorySetVolume(0, 0.0f);
+            std::cout << "[Mod] Muted cat 0 (was " << g_originalBgmVolume << "), playing custom BGM." << std::endl;
+            std::uniform_int_distribution<int> dist(0, (int)g_preloadedSounds.size() - 1);
+            g_audio->PlayPreloaded(g_preloadedSounds[dist(g_rng)], g_customBgmVolume, 0, !g_playNewMusic);
+        }
     }
-
-    std::cout << ss.str() << std::endl;
 
     if (fpStartOriginal) return fpStartOriginal(player);
     return 0;
 }
 
 void InitHooks() {
-    // Note: If the game uses a separate DLL for CriWare (e.g. cri_ware_pc.dll), 
-    // change GetModuleHandleA(nullptr) to GetModuleHandleA("cri_ware_pc.dll").
     HMODULE hGame = GetModuleHandleA(nullptr);
-    
+
     if (MH_Initialize() != MH_OK) { std::cout << "[Mod] MinHook Init failed.\n"; return; }
 
-    // SetCueName
     const char* sigSetCueName = "48 89 5C 24 ?? 48 89 6C 24 ?? 56 57 41 56 48 83 EC 20 45 33 F6 49 8B F0";
     uintptr_t addrSetCueName = PatternScan(hGame, sigSetCueName);
-    
     if (addrSetCueName) {
         std::cout << "[Mod] Found criAtomExPlayer_SetCueName at: " << (void*)addrSetCueName << std::endl;
-        
         if (MH_CreateHook((void*)addrSetCueName, &Hook_SetCueName, (void**)&fpSetCueNameOriginal) != MH_OK) {
             std::cout << "[Mod] CreateHook failed.\n"; return;
         }
@@ -182,7 +225,6 @@ void InitHooks() {
         std::cout << "[Mod] Failed to find signature for criAtomExPlayer_SetCueName.\n";
     }
 
-    // SetCategoryById
     const char* sigSetCat = "48 89 5C 24 ?? 48 89 6C 24 ?? 48 89 74 24 ?? 57 48 83 EC 50 48 8B D9 8B FA";
     uintptr_t addrSetCat = PatternScan(hGame, sigSetCat);
     if (addrSetCat) {
@@ -193,18 +235,6 @@ void InitHooks() {
         std::cout << "[Mod] Failed to find signature for criAtomExPlayer_SetCategoryById.\n";
     }
 
-    // Category SetVolume
-    const char* sigCatSetVol = "40 53 48 83 EC 30 48 0F BF D9";
-    uintptr_t addrCatSetVol = PatternScan(hGame, sigCatSetVol);
-    if (addrCatSetVol) {
-        std::cout << "[Mod] Found criAtomExCategory_SetVolume at: " << (void*)addrCatSetVol << std::endl;
-        MH_CreateHook((void*)addrCatSetVol, &Hook_CategorySetVolume, (void**)&fpCategorySetVolumeOriginal);
-        MH_EnableHook((void*)addrCatSetVol);
-    } else {
-        std::cout << "[Mod] Failed to find signature for criAtomExCategory_SetVolume.\n";
-    }
-
-    // Start
     const char* sigStart = "48 89 5C 24 ?? 57 48 83 EC 20 48 8B F9 48 85 C9 75 ?? 44 8D 41 ?? 48 8D 15 ?? ?? ?? ?? E8 ?? ?? ?? ?? 83 C8 FF";
     uintptr_t addrStart = PatternScan(hGame, sigStart);
     if (addrStart) {
@@ -216,7 +246,23 @@ void InitHooks() {
         std::cout << "[Mod] Failed to find signature for criAtomExPlayer_Start.\n";
     }
 
-    // Category GetVolume (Just get address, don't hook)
+    const char* sigLoadAcb = "48 89 5C 24 ?? 48 89 7C 24 ?? 55 48 8D 6C 24 ?? 48 81 EC";
+    uintptr_t addrLoadAcb = PatternScan(hGame, sigLoadAcb);
+    if (addrLoadAcb) {
+        std::cout << "[Mod] Found criAtomExAcb_LoadAcbFile at: " << (void*)addrLoadAcb << std::endl;
+        MH_CreateHook((void*)addrLoadAcb, &Hook_LoadAcbFile, (void**)&fpLoadAcbFileOriginal);
+        MH_EnableHook((void*)addrLoadAcb);
+    }
+
+    const char* sigCatSetVol = "40 53 48 83 EC 30 48 0F BF D9";
+    uintptr_t addrCatSetVol = PatternScan(hGame, sigCatSetVol);
+    if (addrCatSetVol) {
+        std::cout << "[Mod] Found criAtomExCategory_SetVolume at: " << (void*)addrCatSetVol << std::endl;
+        fpCategorySetVolume = (criAtomExCategory_SetVolume_t)addrCatSetVol;
+    } else {
+        std::cout << "[Mod] Failed to find signature for criAtomExCategory_SetVolume.\n";
+    }
+
     const char* sigCatVol = "40 53 48 83 EC 20 83 64 24 ?? 00";
     uintptr_t addrCatVol = PatternScan(hGame, sigCatVol);
     if (addrCatVol) {
@@ -227,23 +273,25 @@ void InitHooks() {
     }
 }
 
-// The background worker thread
 void InputLoop() {
-    // Initialize AudioEngine on this thread's stack, but expose it globally
     AudioEngine audio;
     if (!audio.Init()) {
         MessageBoxA(nullptr, "Failed to Init XAudio2", "Mod Error", MB_OK);
         return;
     }
     g_audio = &audio;
+    audio.m_onBgmFinished = []() {
+        if (g_playedFinish.load() || g_preloadedSounds.empty()) return;
+        std::uniform_int_distribution<int> dist(0, (int)g_preloadedSounds.size() - 1);
+        g_audio->PlayPreloaded(g_preloadedSounds[dist(g_rng)], g_customBgmVolume, 0, false);
+        std::cout << "[Mod] PlayNewMusic: shuffled to next track." << std::endl;
+    };
 
-    // Create a console window to see the logs
     AllocConsole();
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
     freopen_s(&f, "CONOUT$", "w", stderr);
 
-    // Get the directory of the current DLL so we can load the wav from next to it
     char pathBuffer[MAX_PATH];
     if (GetModuleFileNameA(g_hModule, pathBuffer, MAX_PATH) == 0) {
         std::cout << "[Mod] Error getting DLL path." << std::endl;
@@ -252,40 +300,93 @@ void InputLoop() {
 
     std::string dllDir = pathBuffer;
     size_t lastSlash = dllDir.find_last_of("\\/");
-    if (lastSlash != std::string::npos) {
+    if (lastSlash != std::string::npos)
         dllDir = dllDir.substr(0, lastSlash);
-    }
 
-    g_soundPath = dllDir + "\\test.wav";
-
-    if (GetFileAttributesA(g_soundPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        std::cout << "[Mod] Sound file found at: " << g_soundPath << std::endl;
+    std::string settingsPath = dllDir + "\\settings.txt";
+    std::ifstream settingsFile(settingsPath);
+    if (settingsFile.is_open()) {
+        std::string line;
+        while (std::getline(settingsFile, line)) {
+            if (line.find("PlayNewMusic:") != std::string::npos) {
+                g_playNewMusic = (line.find("true") != std::string::npos);
+                std::cout << "[Mod] PlayNewMusic: " << (g_playNewMusic ? "true" : "false") << std::endl;
+            }
+            if (line.find("Volume:") != std::string::npos) {
+                size_t colon = line.find(':');
+                if (colon != std::string::npos) {
+                    std::string val = line.substr(colon + 1);
+                    char* end;
+                    float v = std::strtof(val.c_str(), &end);
+                    if (end != val.c_str() && v >= 0.0f && v <= 5.0f)
+                        g_customBgmVolume = v;
+                }
+            }
+        }
     } else {
-        std::cout << "[Mod] ERROR: test.wav not found next to DLL! Expected at: " << g_soundPath << std::endl;
+        std::cout << "[Mod] No settings.txt found, using defaults." << std::endl;
     }
 
-    // Initialize hooks AFTER setting up audio and paths
+    std::string musicDir = dllDir + "\\music";
+
+    for (const char* ext : { "\\*.wav", "\\*.mp3", "\\*.ogg", "\\*.adx", "\\*.brstm", "\\*.flac" }) {
+        WIN32_FIND_DATAA findData;
+        HANDLE hFind = FindFirstFileA((musicDir + ext).c_str(), &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                std::string fullPath = musicDir + "\\" + findData.cFileName;
+                g_soundPaths.push_back(fullPath);
+                std::cout << "[Mod] Found: " << fullPath << std::endl;
+            } while (FindNextFileA(hFind, &findData));
+            FindClose(hFind);
+        }
+    }
+    if (g_soundPaths.empty())
+        std::cout << "[Mod] No music files found in 'music' folder!" << std::endl;
+
+    for (const auto& path : g_soundPaths) {
+        WavData data;
+        if (AudioLoader::Load(path, data)) {
+            g_preloadedSounds.push_back(std::move(data));
+        }
+    }
+    std::cout << "[Mod] Pre-loaded " << g_preloadedSounds.size() << " BGM sound(s)." << std::endl;
+
+    std::cout << "[Mod] BGM Replacement loaded." << std::endl;
+
     InitHooks();
 
-    bool wasPressed = false;
-
     while (bIsRunning) {
-        // Check for Numpad 1 or standard Number 1
-        // GetAsyncKeyState checks hardware state asynchronously (bypassing UE input)
-        bool isPressed = ((GetAsyncKeyState(VK_NUMPAD1) & 0x8000) != 0) || ((GetAsyncKeyState('1') & 0x8000) != 0);
-
-        if (isPressed && !wasPressed) {
-            // Key Down Event
-            audio.PlayWave(g_soundPath);
+        audio.Update();
+        if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
+            static bool prevUp = false, prevDown = false;
+            bool curUp = (GetAsyncKeyState(VK_UP) & 0x8000) != 0;
+            bool curDown = (GetAsyncKeyState(VK_DOWN) & 0x8000) != 0;
+            if (curUp && !prevUp) {
+                g_customBgmVolume = std::min(5.0f, g_customBgmVolume + 0.1f);
+                std::cout << "[Mod] Volume: " << (int)(g_customBgmVolume * 100) << "%" << std::endl;
+                audio.SetCategoryVolume(0, g_customBgmVolume);
+            }
+            if (curDown && !prevDown) {
+                g_customBgmVolume = std::max(0.0f, g_customBgmVolume - 0.1f);
+                std::cout << "[Mod] Volume: " << (int)(g_customBgmVolume * 100) << "%" << std::endl;
+                audio.SetCategoryVolume(0, g_customBgmVolume);
+            }
+            if ((curUp && !prevUp) || (curDown && !prevDown)) {
+                std::ofstream out(dllDir + "\\settings.txt");
+                if (out.is_open()) {
+                    out << "//Play another music file after one is finished instead of looping? true or false" << std::endl;
+                    out << "PlayNewMusic: " << (g_playNewMusic ? "true" : "false") << std::endl;
+                    out << "//Custom BGM volume (0.0 - 5.0)" << std::endl;
+                    out << "Volume: " << g_customBgmVolume << std::endl;
+                }
+            }
+            prevUp = curUp;
+            prevDown = curDown;
         }
-
-        wasPressed = isPressed;
-
-        // Sleep to prevent high CPU usage in this thread
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    // Clear global pointer before exiting
     g_audio = nullptr;
 }
 
@@ -298,14 +399,12 @@ extern "C" __declspec(dllexport) void uninstall_mod() {
     bIsRunning = false;
 }
 
-// Standard DLL Entry Point
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
         g_hModule = hModule;
         DisableThreadLibraryCalls(hModule);
         break;
-
     case DLL_PROCESS_DETACH:
         bIsRunning = false;
         break;

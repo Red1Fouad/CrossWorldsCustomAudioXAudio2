@@ -1,0 +1,11 @@
+; Configuration File for Audio Replacement
+; Format: CueName = WavFileName.wav, Type
+; Type options: SE, BGM, VOICE
+; Note: The comma is required.
+
+SE_MENU_SELECT_01 = test.wav, SE
+SE_BUTTON_01      = click.wav, SE
+BGM_TITLE_01      = custom_bgm.wav, BGM
+VOICE_HERO_ATK    = attack_shout.wav, VOICE
+
+# You can add comments with # or ;
