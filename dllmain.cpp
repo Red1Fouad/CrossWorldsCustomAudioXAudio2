@@ -190,11 +190,7 @@ uint32_t Hook_Start(void* player) {
             return true;
         };
         auto isLobby = [&]() -> bool {
-            const std::string p = "BGM_LOBBY_";
-            if (name.find(p) != 0) return false;
-            for (size_t i = p.size(); i < name.size(); i++)
-                if (!isdigit((unsigned char)name[i])) return false;
-            return name.size() > p.size();
+            return name.find("BGM_LOBBY_") == 0;
         };
 
         bool isLobbyCue = isLobby();
