@@ -31,12 +31,15 @@ std::mutex g_playerMutex;
 AudioEngine* g_audio = nullptr;
 std::vector<std::string> g_soundPaths;
 std::vector<WavData> g_preloadedSounds;
+std::vector<WavData> g_preloadedLobbySounds;
 std::atomic<bool> g_playedFinish{ false };
 bool g_playNewMusic = false;
 bool g_muteOnUnfocus = false;
+bool g_isLobbyActive = false;
 float g_customBgmVolume = 1.0f;
 float g_originalBgmVolume = 1.0f;
 int g_lastPlayedIndex = -1;
+int g_lastPlayedLobbyIndex = -1;
 std::mt19937 g_rng(std::random_device{}());
 
 std::vector<int> ParseSignature(const std::string& signature) {
@@ -186,23 +189,35 @@ uint32_t Hook_Start(void* player) {
                 if (!isdigit((unsigned char)name[i])) return false;
             return true;
         };
-        bool isCustomBgm = (name == "BGM_LAP1" || name == "BGM_LAP2_FORCE" || isGpFinal());
+        auto isLobby = [&]() -> bool {
+            const std::string p = "BGM_LOBBY_";
+            if (name.find(p) != 0) return false;
+            for (size_t i = p.size(); i < name.size(); i++)
+                if (!isdigit((unsigned char)name[i])) return false;
+            return name.size() > p.size();
+        };
+
+        bool isLobbyCue = isLobby();
+        bool isCustomBgm = (name == "BGM_LAP1" || name == "BGM_LAP2_FORCE" || isGpFinal() || isLobbyCue);
 
         if (!isCustomBgm && fpCategorySetVolume)
             fpCategorySetVolume(0, g_originalBgmVolume);
 
-        if (g_audio) g_audio->StopCategory(0);
+        auto& pool = isLobbyCue ? g_preloadedLobbySounds : g_preloadedSounds;
+        auto& lastIdx = isLobbyCue ? g_lastPlayedLobbyIndex : g_lastPlayedIndex;
 
-        if (isCustomBgm && !g_preloadedSounds.empty()) {
+        if (isCustomBgm && !pool.empty()) {
+            if (g_audio) g_audio->StopCategory(0);
+            g_isLobbyActive = isLobbyCue;
             g_playedFinish.store(false);
             if (fpCategoryGetVolume) g_originalBgmVolume = fpCategoryGetVolume(0);
             if (fpCategorySetVolume) fpCategorySetVolume(0, 0.0f);
-            std::cout << "[Mod] Muted cat 0 (was " << g_originalBgmVolume << "), playing custom BGM." << std::endl;
+            std::cout << "[Mod] Muted cat 0 (was " << g_originalBgmVolume << "), playing " << (isLobbyCue ? "lobby" : "BGM") << " music." << std::endl;
             int idx;
-            do { idx = std::uniform_int_distribution<int>(0, (int)g_preloadedSounds.size() - 1)(g_rng); }
-            while (idx == g_lastPlayedIndex && g_preloadedSounds.size() > 1);
-            g_lastPlayedIndex = idx;
-            g_audio->PlayPreloaded(g_preloadedSounds[idx], g_customBgmVolume, 0, !g_playNewMusic);
+            do { idx = std::uniform_int_distribution<int>(0, (int)pool.size() - 1)(g_rng); }
+            while (idx == lastIdx && pool.size() > 1);
+            lastIdx = idx;
+            g_audio->PlayPreloaded(pool[idx], g_customBgmVolume, 0, !g_playNewMusic);
         }
     }
 
@@ -286,13 +301,16 @@ void InputLoop() {
     }
     g_audio = &audio;
     audio.m_onBgmFinished = []() {
-        if (g_playedFinish.load() || g_preloadedSounds.empty()) return;
+        if (g_playedFinish.load()) return;
+        auto& pool = g_isLobbyActive ? g_preloadedLobbySounds : g_preloadedSounds;
+        auto& lastIdx = g_isLobbyActive ? g_lastPlayedLobbyIndex : g_lastPlayedIndex;
+        if (pool.empty()) return;
         int idx;
-        do { idx = std::uniform_int_distribution<int>(0, (int)g_preloadedSounds.size() - 1)(g_rng); }
-        while (idx == g_lastPlayedIndex && g_preloadedSounds.size() > 1);
-        g_lastPlayedIndex = idx;
-        g_audio->PlayPreloaded(g_preloadedSounds[idx], g_customBgmVolume, 0, false);
-        std::cout << "[Mod] PlayNewMusic: shuffled to next track." << std::endl;
+        do { idx = std::uniform_int_distribution<int>(0, (int)pool.size() - 1)(g_rng); }
+        while (idx == lastIdx && pool.size() > 1);
+        lastIdx = idx;
+        g_audio->PlayPreloaded(pool[idx], g_customBgmVolume, 0, false);
+        std::cout << "[Mod] PlayNewMusic: shuffled to next " << (g_isLobbyActive ? "lobby" : "BGM") << " track." << std::endl;
     };
 
     AllocConsole();
@@ -363,6 +381,23 @@ void InputLoop() {
         }
     }
     std::cout << "[Mod] Pre-loaded " << g_preloadedSounds.size() << " BGM sound(s)." << std::endl;
+
+    std::string lobbyDir = dllDir + "\\music_lobby";
+    for (const char* ext : { "\\*.wav", "\\*.mp3", "\\*.ogg", "\\*.adx", "\\*.brstm", "\\*.flac" }) {
+        WIN32_FIND_DATAA findData;
+        HANDLE hFind = FindFirstFileA((lobbyDir + ext).c_str(), &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                std::string fullPath = lobbyDir + "\\" + findData.cFileName;
+                WavData data;
+                if (AudioLoader::Load(fullPath, data))
+                    g_preloadedLobbySounds.push_back(std::move(data));
+                std::cout << "[Mod] Lobby: " << fullPath << std::endl;
+            } while (FindNextFileA(hFind, &findData));
+            FindClose(hFind);
+        }
+    }
+    std::cout << "[Mod] Pre-loaded " << g_preloadedLobbySounds.size() << " lobby sound(s)." << std::endl;
 
     std::cout << "[Mod] BGM Replacement loaded." << std::endl;
 
