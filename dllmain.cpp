@@ -33,6 +33,7 @@ std::vector<std::string> g_soundPaths;
 std::vector<WavData> g_preloadedSounds;
 std::atomic<bool> g_playedFinish{ false };
 bool g_playNewMusic = false;
+bool g_muteOnUnfocus = false;
 float g_customBgmVolume = 1.0f;
 float g_originalBgmVolume = 1.0f;
 int g_lastPlayedIndex = -1;
@@ -319,6 +320,10 @@ void InputLoop() {
                 g_playNewMusic = (line.find("true") != std::string::npos);
                 std::cout << "[Mod] PlayNewMusic: " << (g_playNewMusic ? "true" : "false") << std::endl;
             }
+            if (line.find("MuteOnUnfocus:") != std::string::npos) {
+                g_muteOnUnfocus = (line.find("true") != std::string::npos);
+                std::cout << "[Mod] MuteOnUnfocus: " << (g_muteOnUnfocus ? "true" : "false") << std::endl;
+            }
             if (line.find("Volume:") != std::string::npos) {
                 size_t colon = line.find(':');
                 if (colon != std::string::npos) {
@@ -363,8 +368,25 @@ void InputLoop() {
 
     InitHooks();
 
+    DWORD ourPid = GetCurrentProcessId();
+    bool wasUnfocused = false;
+
     while (bIsRunning) {
         audio.Update();
+
+        if (g_muteOnUnfocus) {
+            DWORD foregroundPid = 0;
+            HWND fg = GetForegroundWindow();
+            if (fg) GetWindowThreadProcessId(fg, &foregroundPid);
+            bool unfocused = (foregroundPid != ourPid);
+            if (unfocused != wasUnfocused) {
+                wasUnfocused = unfocused;
+                audio.SetCategoryVolume(0, unfocused ? 0.0f : g_customBgmVolume);
+                std::cout << "[Mod] " << (unfocused ? "Unfocused" : "Focused") << " — volume: "
+                          << (unfocused ? 0 : (int)(g_customBgmVolume * 100)) << "%" << std::endl;
+            }
+        }
+
         if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
             static bool prevUp = false, prevDown = false;
             bool curUp = (GetAsyncKeyState(VK_UP) & 0x8000) != 0;
@@ -384,6 +406,8 @@ void InputLoop() {
                 if (out.is_open()) {
                     out << "//Play another music file after one is finished instead of looping? true or false" << std::endl;
                     out << "PlayNewMusic: " << (g_playNewMusic ? "true" : "false") << std::endl;
+                    out << "//Mute custom BGM when game window loses focus" << std::endl;
+                    out << "MuteOnUnfocus: " << (g_muteOnUnfocus ? "true" : "false") << std::endl;
                     out << "//Custom BGM volume (0.0 - 5.0)" << std::endl;
                     out << "Volume: " << g_customBgmVolume << std::endl;
                 }
