@@ -35,6 +35,7 @@ std::atomic<bool> g_playedFinish{ false };
 bool g_playNewMusic = false;
 float g_customBgmVolume = 1.0f;
 float g_originalBgmVolume = 1.0f;
+int g_lastPlayedIndex = -1;
 std::mt19937 g_rng(std::random_device{}());
 
 std::vector<int> ParseSignature(const std::string& signature) {
@@ -196,8 +197,11 @@ uint32_t Hook_Start(void* player) {
             if (fpCategoryGetVolume) g_originalBgmVolume = fpCategoryGetVolume(0);
             if (fpCategorySetVolume) fpCategorySetVolume(0, 0.0f);
             std::cout << "[Mod] Muted cat 0 (was " << g_originalBgmVolume << "), playing custom BGM." << std::endl;
-            std::uniform_int_distribution<int> dist(0, (int)g_preloadedSounds.size() - 1);
-            g_audio->PlayPreloaded(g_preloadedSounds[dist(g_rng)], g_customBgmVolume, 0, !g_playNewMusic);
+            int idx;
+            do { idx = std::uniform_int_distribution<int>(0, (int)g_preloadedSounds.size() - 1)(g_rng); }
+            while (idx == g_lastPlayedIndex && g_preloadedSounds.size() > 1);
+            g_lastPlayedIndex = idx;
+            g_audio->PlayPreloaded(g_preloadedSounds[idx], g_customBgmVolume, 0, !g_playNewMusic);
         }
     }
 
@@ -282,8 +286,11 @@ void InputLoop() {
     g_audio = &audio;
     audio.m_onBgmFinished = []() {
         if (g_playedFinish.load() || g_preloadedSounds.empty()) return;
-        std::uniform_int_distribution<int> dist(0, (int)g_preloadedSounds.size() - 1);
-        g_audio->PlayPreloaded(g_preloadedSounds[dist(g_rng)], g_customBgmVolume, 0, false);
+        int idx;
+        do { idx = std::uniform_int_distribution<int>(0, (int)g_preloadedSounds.size() - 1)(g_rng); }
+        while (idx == g_lastPlayedIndex && g_preloadedSounds.size() > 1);
+        g_lastPlayedIndex = idx;
+        g_audio->PlayPreloaded(g_preloadedSounds[idx], g_customBgmVolume, 0, false);
         std::cout << "[Mod] PlayNewMusic: shuffled to next track." << std::endl;
     };
 
