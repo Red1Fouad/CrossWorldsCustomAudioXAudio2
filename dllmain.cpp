@@ -196,8 +196,10 @@ uint32_t Hook_Start(void* player) {
         bool isLobbyCue = isLobby();
         bool isCustomBgm = (name == "BGM_LAP1" || name == "BGM_LAP2_FORCE" || isGpFinal() || isLobbyCue);
 
-        if (!isCustomBgm && fpCategorySetVolume)
-            fpCategorySetVolume(0, g_originalBgmVolume);
+        if (!isCustomBgm) {
+            if (fpCategorySetVolume) fpCategorySetVolume(0, g_originalBgmVolume);
+            if (g_audio) g_audio->StopCategory(0);
+        }
 
         auto& pool = isLobbyCue ? g_preloadedLobbySounds : g_preloadedSounds;
         auto& lastIdx = isLobbyCue ? g_lastPlayedLobbyIndex : g_lastPlayedIndex;
