@@ -44,6 +44,26 @@ int g_lastPlayedLobbyIndex = -1;
 int g_lastPlayedTitleIndex = -1;
 std::mt19937 g_rng(std::random_device{}());
 
+void NormalizePcm16(WavData& data) {
+    if (data.audioData.empty() || data.wfx.wBitsPerSample != 16) return;
+    int16_t* samples = reinterpret_cast<int16_t*>(data.audioData.data());
+    size_t count = data.audioData.size() / 2;
+    int16_t peak = 0;
+    for (size_t i = 0; i < count; i++) {
+        int16_t s = samples[i];
+        if (s < 0) s = -s;
+        if (s > peak) peak = s;
+    }
+    if (peak == 0) return;
+    float gain = (0.90f * 32767.0f) / (float)peak;
+    for (size_t i = 0; i < count; i++) {
+        float scaled = samples[i] * gain;
+        if (scaled > 32767.0f) scaled = 32767.0f;
+        if (scaled < -32768.0f) scaled = -32768.0f;
+        samples[i] = (int16_t)scaled;
+    }
+}
+
 std::vector<int> ParseSignature(const std::string& signature) {
     std::vector<int> bytes;
     std::stringstream ss(signature);
@@ -399,6 +419,7 @@ void InputLoop() {
     for (const auto& path : g_soundPaths) {
         WavData data;
         if (AudioLoader::Load(path, data)) {
+            NormalizePcm16(data);
             g_preloadedSounds.push_back(std::move(data));
         }
     }
@@ -412,8 +433,10 @@ void InputLoop() {
             do {
                 std::string fullPath = lobbyDir + "\\" + findData.cFileName;
                 WavData data;
-                if (AudioLoader::Load(fullPath, data))
+                if (AudioLoader::Load(fullPath, data)) {
+                    NormalizePcm16(data);
                     g_preloadedLobbySounds.push_back(std::move(data));
+                }
                 std::cout << "[Mod] Lobby: " << fullPath << std::endl;
             } while (FindNextFileA(hFind, &findData));
             FindClose(hFind);
@@ -429,8 +452,10 @@ void InputLoop() {
             do {
                 std::string fullPath = titleDir + "\\" + findData.cFileName;
                 WavData data;
-                if (AudioLoader::Load(fullPath, data))
+                if (AudioLoader::Load(fullPath, data)) {
+                    NormalizePcm16(data);
                     g_preloadedTitleSounds.push_back(std::move(data));
+                }
                 std::cout << "[Mod] Title: " << fullPath << std::endl;
             } while (FindNextFileA(hFind, &findData));
             FindClose(hFind);
