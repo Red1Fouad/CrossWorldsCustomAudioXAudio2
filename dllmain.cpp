@@ -220,7 +220,8 @@ uint32_t Hook_Start(void* player) {
             if (g_audio) g_audio->StopCategory(0);
             g_activePool = poolId;
             g_playedFinish.store(false);
-            if (fpCategoryGetVolume) g_originalBgmVolume = fpCategoryGetVolume(0);
+            float curVol = fpCategoryGetVolume ? fpCategoryGetVolume(0) : 1.0f;
+            if (curVol > 0.0f) g_originalBgmVolume = curVol;
             if (fpCategorySetVolume) fpCategorySetVolume(0, 0.0f);
             std::cout << "[Mod] Muted cat 0 (was " << g_originalBgmVolume << "), playing " << poolName << " music." << std::endl;
             int idx;
