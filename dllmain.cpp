@@ -30,18 +30,21 @@ std::mutex g_playerMutex;
 
 AudioEngine* g_audio = nullptr;
 std::vector<std::string> g_soundPaths;
-std::vector<WavData> g_preloadedSounds;
-std::vector<WavData> g_preloadedLobbySounds;
-std::vector<WavData> g_preloadedTitleSounds;
+std::vector<TrackInfo> g_preloadedSounds;
+std::vector<TrackInfo> g_preloadedLobbySounds;
+std::vector<TrackInfo> g_preloadedTitleSounds;
 std::atomic<bool> g_playedFinish{ false };
 bool g_playNewMusic = false;
 bool g_muteOnUnfocus = false;
 int g_activePool = 0; // 0=bgm, 1=lobby, 2=title
 float g_customBgmVolume = 1.0f;
 float g_originalBgmVolume = 1.0f;
-int g_lastPlayedIndex = -1;
-int g_lastPlayedLobbyIndex = -1;
-int g_lastPlayedTitleIndex = -1;
+std::vector<int> g_bgmOrder;
+int g_bgmOrderPos = 0;
+std::vector<int> g_lobbyOrder;
+int g_lobbyOrderPos = 0;
+std::vector<int> g_titleOrder;
+int g_titleOrderPos = 0;
 std::mt19937 g_rng(std::random_device{}());
 
 void NormalizePcm16(WavData& data) {
@@ -62,6 +65,93 @@ void NormalizePcm16(WavData& data) {
         if (scaled < -32768.0f) scaled = -32768.0f;
         samples[i] = (int16_t)scaled;
     }
+}
+
+void ScalePcm16(WavData& data, float mul) {
+    if (data.audioData.empty() || data.wfx.wBitsPerSample != 16 || mul == 1.0f) return;
+    int16_t* s = reinterpret_cast<int16_t*>(data.audioData.data());
+    size_t cnt = data.audioData.size() / 2;
+    for (size_t i = 0; i < cnt; i++) {
+        float v = s[i] * mul;
+        if (v > 32767.0f) v = 32767.0f;
+        if (v < -32768.0f) v = -32768.0f;
+        s[i] = (int16_t)v;
+    }
+}
+
+struct TrackMeta {
+    float weight = 1.0f;
+    float volumeMul = 1.0f;
+};
+
+std::map<std::string, TrackMeta> ParseTrackMeta(const std::string& dir) {
+    std::map<std::string, TrackMeta> meta;
+    std::ifstream f(dir + "\\tracks.txt");
+    if (!f.is_open()) return meta;
+    std::string line;
+    while (std::getline(f, line)) {
+        size_t s = line.find_first_not_of(" \t\r");
+        if (s == std::string::npos) continue;
+        line = line.substr(s);
+        if (line.empty() || line[0] == ';' || line[0] == '/') continue;
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string name = line.substr(0, colon);
+        size_t ne = name.find_last_not_of(" \t");
+        if (ne != std::string::npos) name = name.substr(0, ne + 1);
+        std::string rest = line.substr(colon + 1);
+        for (auto& c : rest) if (c == ',') c = ' ';
+        std::stringstream ss(rest);
+        TrackMeta tm;
+        float v;
+        int idx = 0;
+        while (ss >> v) {
+            if (idx == 0) tm.weight = std::max(0.0f, v);
+            else if (idx == 1) tm.volumeMul = std::max(0.0f, v);
+            idx++;
+        }
+        meta[name] = tm;
+    }
+    return meta;
+}
+
+void BuildShuffleOrder(std::vector<int>& order, const std::vector<TrackInfo>& pool) {
+    order.clear();
+    if (pool.empty()) return;
+    std::vector<int> remaining;
+    for (int i = 0; i < (int)pool.size(); i++)
+        remaining.push_back(i);
+    while (!remaining.empty()) {
+        float total = 0;
+        for (int idx : remaining)
+            total += std::max(0.0f, pool[idx].weight);
+        int selected = -1;
+        if (total > 0) {
+            std::uniform_real_distribution<float> dist(0.0f, total);
+            float r = dist(g_rng);
+            float accum = 0;
+            for (int i = 0; i < (int)remaining.size(); i++) {
+                accum += std::max(0.0f, pool[remaining[i]].weight);
+                if (r < accum) { selected = remaining[i]; break; }
+            }
+        } else {
+            selected = remaining[std::uniform_int_distribution<int>(0, (int)remaining.size() - 1)(g_rng)];
+        }
+        if (selected >= 0) {
+            order.push_back(selected);
+            remaining.erase(std::remove(remaining.begin(), remaining.end(), selected), remaining.end());
+        }
+    }
+}
+
+int GetNextShuffledIndex(std::vector<TrackInfo>& pool, std::vector<int>& order, int& pos) {
+    if (pool.empty()) return -1;
+    if (pos >= (int)order.size()) {
+        BuildShuffleOrder(order, pool);
+        pos = 0;
+    }
+    if (order.empty()) return -1;
+    return order[pos++];
 }
 
 std::vector<int> ParseSignature(const std::string& signature) {
@@ -222,18 +312,24 @@ uint32_t Hook_Start(void* player) {
             if (g_audio) g_audio->StopCategory(0);
         }
 
-        auto getPool = [&](int pid) -> std::vector<WavData>& {
+        auto getPool = [&](int pid) -> std::vector<TrackInfo>& {
             if (pid == 1) return g_preloadedLobbySounds;
             if (pid == 2) return g_preloadedTitleSounds;
             return g_preloadedSounds;
         };
-        auto getLastIdx = [&](int pid) -> int& {
-            if (pid == 1) return g_lastPlayedLobbyIndex;
-            if (pid == 2) return g_lastPlayedTitleIndex;
-            return g_lastPlayedIndex;
+        auto getOrder = [&](int pid) -> std::vector<int>& {
+            if (pid == 1) return g_lobbyOrder;
+            if (pid == 2) return g_titleOrder;
+            return g_bgmOrder;
+        };
+        auto getPos = [&](int pid) -> int& {
+            if (pid == 1) return g_lobbyOrderPos;
+            if (pid == 2) return g_titleOrderPos;
+            return g_bgmOrderPos;
         };
         auto& pool = getPool(poolId);
-        auto& lastIdx = getLastIdx(poolId);
+        auto& order = getOrder(poolId);
+        auto& pos = getPos(poolId);
         const char* poolName = poolId == 1 ? "lobby" : poolId == 2 ? "title" : "BGM";
 
         if (isCustomBgm && !pool.empty()) {
@@ -244,11 +340,8 @@ uint32_t Hook_Start(void* player) {
             if (curVol > 0.0f) g_originalBgmVolume = curVol;
             if (fpCategorySetVolume) fpCategorySetVolume(0, 0.0f);
             std::cout << "[Mod] Muted cat 0 (was " << g_originalBgmVolume << "), playing " << poolName << " music." << std::endl;
-            int idx;
-            do { idx = std::uniform_int_distribution<int>(0, (int)pool.size() - 1)(g_rng); }
-            while (idx == lastIdx && pool.size() > 1);
-            lastIdx = idx;
-            g_audio->PlayPreloaded(pool[idx], g_customBgmVolume, 0, !g_playNewMusic);
+            int idx = GetNextShuffledIndex(pool, order, pos);
+            g_audio->PlayPreloaded(pool[idx].data, g_customBgmVolume, 0, !g_playNewMusic);
         }
     }
 
@@ -333,25 +426,28 @@ void InputLoop() {
     g_audio = &audio;
     audio.m_onBgmFinished = []() {
         if (g_playedFinish.load()) return;
-        auto getPool = [](int pid) -> std::vector<WavData>& {
+        auto getPool = [](int pid) -> std::vector<TrackInfo>& {
             if (pid == 1) return g_preloadedLobbySounds;
             if (pid == 2) return g_preloadedTitleSounds;
             return g_preloadedSounds;
         };
-        auto getLastIdx = [](int pid) -> int& {
-            if (pid == 1) return g_lastPlayedLobbyIndex;
-            if (pid == 2) return g_lastPlayedTitleIndex;
-            return g_lastPlayedIndex;
+        auto getOrder = [](int pid) -> std::vector<int>& {
+            if (pid == 1) return g_lobbyOrder;
+            if (pid == 2) return g_titleOrder;
+            return g_bgmOrder;
+        };
+        auto getPos = [](int pid) -> int& {
+            if (pid == 1) return g_lobbyOrderPos;
+            if (pid == 2) return g_titleOrderPos;
+            return g_bgmOrderPos;
         };
         const char* poolName = g_activePool == 1 ? "lobby" : g_activePool == 2 ? "title" : "BGM";
         auto& pool = getPool(g_activePool);
-        auto& lastIdx = getLastIdx(g_activePool);
+        auto& order = getOrder(g_activePool);
+        auto& pos = getPos(g_activePool);
         if (pool.empty()) return;
-        int idx;
-        do { idx = std::uniform_int_distribution<int>(0, (int)pool.size() - 1)(g_rng); }
-        while (idx == lastIdx && pool.size() > 1);
-        lastIdx = idx;
-        g_audio->PlayPreloaded(pool[idx], g_customBgmVolume, 0, false);
+        int idx = GetNextShuffledIndex(pool, order, pos);
+        g_audio->PlayPreloaded(pool[idx].data, g_customBgmVolume, 0, false);
         std::cout << "[Mod] PlayNewMusic: shuffled to next " << poolName << " track." << std::endl;
     };
 
@@ -400,6 +496,7 @@ void InputLoop() {
     }
 
     std::string musicDir = dllDir + "\\music";
+    auto bgmMeta = ParseTrackMeta(musicDir);
 
     for (const char* ext : { "\\*.wav", "\\*.mp3", "\\*.ogg", "\\*.adx", "\\*.brstm", "\\*.flac" }) {
         WIN32_FIND_DATAA findData;
@@ -420,12 +517,23 @@ void InputLoop() {
         WavData data;
         if (AudioLoader::Load(path, data)) {
             NormalizePcm16(data);
-            g_preloadedSounds.push_back(std::move(data));
+            std::string fname = path;
+            size_t bs = fname.find_last_of("\\/");
+            if (bs != std::string::npos) fname = fname.substr(bs + 1);
+            auto it = bgmMeta.find(fname);
+            TrackMeta tm;
+            if (it != bgmMeta.end()) tm = it->second;
+            ScalePcm16(data, tm.volumeMul);
+            TrackInfo ti;
+            ti.data = std::move(data);
+            ti.weight = tm.weight;
+            g_preloadedSounds.push_back(std::move(ti));
         }
     }
     std::cout << "[Mod] Pre-loaded " << g_preloadedSounds.size() << " BGM sound(s)." << std::endl;
 
     std::string lobbyDir = dllDir + "\\music_lobby";
+    auto lobbyMeta = ParseTrackMeta(lobbyDir);
     for (const char* ext : { "\\*.wav", "\\*.mp3", "\\*.ogg", "\\*.adx", "\\*.brstm", "\\*.flac" }) {
         WIN32_FIND_DATAA findData;
         HANDLE hFind = FindFirstFileA((lobbyDir + ext).c_str(), &findData);
@@ -435,7 +543,14 @@ void InputLoop() {
                 WavData data;
                 if (AudioLoader::Load(fullPath, data)) {
                     NormalizePcm16(data);
-                    g_preloadedLobbySounds.push_back(std::move(data));
+                    auto it = lobbyMeta.find(findData.cFileName);
+                    TrackMeta tm;
+                    if (it != lobbyMeta.end()) tm = it->second;
+                    ScalePcm16(data, tm.volumeMul);
+                    TrackInfo ti;
+                    ti.data = std::move(data);
+                    ti.weight = tm.weight;
+                    g_preloadedLobbySounds.push_back(std::move(ti));
                 }
                 std::cout << "[Mod] Lobby: " << fullPath << std::endl;
             } while (FindNextFileA(hFind, &findData));
@@ -445,6 +560,7 @@ void InputLoop() {
     std::cout << "[Mod] Pre-loaded " << g_preloadedLobbySounds.size() << " lobby sound(s)." << std::endl;
 
     std::string titleDir = dllDir + "\\music_title";
+    auto titleMeta = ParseTrackMeta(titleDir);
     for (const char* ext : { "\\*.wav", "\\*.mp3", "\\*.ogg", "\\*.adx", "\\*.brstm", "\\*.flac" }) {
         WIN32_FIND_DATAA findData;
         HANDLE hFind = FindFirstFileA((titleDir + ext).c_str(), &findData);
@@ -454,7 +570,14 @@ void InputLoop() {
                 WavData data;
                 if (AudioLoader::Load(fullPath, data)) {
                     NormalizePcm16(data);
-                    g_preloadedTitleSounds.push_back(std::move(data));
+                    auto it = titleMeta.find(findData.cFileName);
+                    TrackMeta tm;
+                    if (it != titleMeta.end()) tm = it->second;
+                    ScalePcm16(data, tm.volumeMul);
+                    TrackInfo ti;
+                    ti.data = std::move(data);
+                    ti.weight = tm.weight;
+                    g_preloadedTitleSounds.push_back(std::move(ti));
                 }
                 std::cout << "[Mod] Title: " << fullPath << std::endl;
             } while (FindNextFileA(hFind, &findData));
@@ -488,8 +611,11 @@ void InputLoop() {
 
         if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
             static bool prevUp = false, prevDown = false;
+            static bool prevLeft = false, prevRight = false;
             bool curUp = (GetAsyncKeyState(VK_UP) & 0x8000) != 0;
             bool curDown = (GetAsyncKeyState(VK_DOWN) & 0x8000) != 0;
+            bool curLeft = (GetAsyncKeyState(VK_LEFT) & 0x8000) != 0;
+            bool curRight = (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0;
             if (curUp && !prevUp) {
                 g_customBgmVolume = std::min(5.0f, g_customBgmVolume + 0.1f);
                 std::cout << "[Mod] Volume: " << (int)(g_customBgmVolume * 100) << "%" << std::endl;
@@ -511,8 +637,64 @@ void InputLoop() {
                     out << "Volume: " << g_customBgmVolume << std::endl;
                 }
             }
+            if (curRight && !prevRight) {
+                auto getPool = [](int pid) -> std::vector<TrackInfo>& {
+                    if (pid == 1) return g_preloadedLobbySounds;
+                    if (pid == 2) return g_preloadedTitleSounds;
+                    return g_preloadedSounds;
+                };
+                auto getOrder = [](int pid) -> std::vector<int>& {
+                    if (pid == 1) return g_lobbyOrder;
+                    if (pid == 2) return g_titleOrder;
+                    return g_bgmOrder;
+                };
+                auto getPos = [](int pid) -> int& {
+                    if (pid == 1) return g_lobbyOrderPos;
+                    if (pid == 2) return g_titleOrderPos;
+                    return g_bgmOrderPos;
+                };
+                const char* poolName = g_activePool == 1 ? "lobby" : g_activePool == 2 ? "title" : "BGM";
+                auto& pool = getPool(g_activePool);
+                auto& order = getOrder(g_activePool);
+                auto& pos = getPos(g_activePool);
+                if (!pool.empty()) {
+                    int idx = GetNextShuffledIndex(pool, order, pos);
+                    audio.StopCategoryImmediate(0);
+                    audio.PlayPreloaded(pool[idx].data, g_customBgmVolume, 0, !g_playNewMusic);
+                    std::cout << "[Mod] Skip -> " << poolName << " track." << std::endl;
+                }
+            }
+            if (curLeft && !prevLeft) {
+                auto getPool = [](int pid) -> std::vector<TrackInfo>& {
+                    if (pid == 1) return g_preloadedLobbySounds;
+                    if (pid == 2) return g_preloadedTitleSounds;
+                    return g_preloadedSounds;
+                };
+                auto getOrder = [](int pid) -> std::vector<int>& {
+                    if (pid == 1) return g_lobbyOrder;
+                    if (pid == 2) return g_titleOrder;
+                    return g_bgmOrder;
+                };
+                auto getPos = [](int pid) -> int& {
+                    if (pid == 1) return g_lobbyOrderPos;
+                    if (pid == 2) return g_titleOrderPos;
+                    return g_bgmOrderPos;
+                };
+                const char* poolName = g_activePool == 1 ? "lobby" : g_activePool == 2 ? "title" : "BGM";
+                auto& pool = getPool(g_activePool);
+                auto& order = getOrder(g_activePool);
+                auto& pos = getPos(g_activePool);
+                if (!pool.empty() && pos > 0) {
+                    int curIdx = order[pos - 1];
+                    audio.StopCategoryImmediate(0);
+                    audio.PlayPreloaded(pool[curIdx].data, g_customBgmVolume, 0, !g_playNewMusic);
+                    std::cout << "[Mod] Restart current " << poolName << " track." << std::endl;
+                }
+            }
             prevUp = curUp;
             prevDown = curDown;
+            prevLeft = curLeft;
+            prevRight = curRight;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }

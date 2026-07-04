@@ -115,6 +115,21 @@ public:
         }
     }
 
+    void StopCategoryImmediate(int catId) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto it = m_voices.begin(); it != m_voices.end(); ) {
+            if (it->categoryId == catId) {
+                it->pVoice->Stop();
+                it->pVoice->FlushSourceBuffers();
+                it->pVoice->DestroyVoice();
+                delete[] it->pBuffer;
+                it = m_voices.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     void PlayWave(const std::string& path, float volume, int categoryId) {
         if (!pXAudio2) return;
 

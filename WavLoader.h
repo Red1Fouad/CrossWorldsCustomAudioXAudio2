@@ -30,6 +30,11 @@ struct WavData {
     UINT32 loopLength = 0;
 };
 
+struct TrackInfo {
+    WavData data;
+    float weight = 1.0f;
+};
+
 class AudioLoader {
 public:
     static bool Load(const std::string& filename, WavData& outData) {
