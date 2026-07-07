@@ -44,7 +44,7 @@ public:
         hr = XAudio2Create(&pXAudio2, 0, XAUDIO2_DEFAULT_PROCESSOR);
         if (FAILED(hr)) return false;
 
-        hr = pXAudio2->CreateMasteringVoice(&pMasterVoice);
+        hr = pXAudio2->CreateMasteringVoice(&pMasterVoice, 2);
         if (FAILED(hr)) return false;
 
         return true;

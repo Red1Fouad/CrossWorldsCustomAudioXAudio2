@@ -79,6 +79,26 @@ void ScalePcm16(WavData& data, float mul) {
     }
 }
 
+static std::string WideToUtf8(const wchar_t* wide) {
+    if (!wide || !*wide) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return {};
+    std::string utf8(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide, -1, &utf8[0], len, nullptr, nullptr);
+    utf8.resize(len - 1);
+    return utf8;
+}
+
+static std::wstring Utf8ToWide(const std::string& utf8) {
+    if (utf8.empty()) return {};
+    int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
+    if (len <= 0) return {};
+    std::wstring wide(len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, &wide[0], len);
+    wide.resize(len - 1);
+    return wide;
+}
+
 struct TrackMeta {
     float weight = 1.0f;
     float volumeMul = 1.0f;
@@ -86,7 +106,8 @@ struct TrackMeta {
 
 std::map<std::string, TrackMeta> ParseTrackMeta(const std::string& dir) {
     std::map<std::string, TrackMeta> meta;
-    std::ifstream f(dir + "\\tracks.txt");
+    std::wstring wdir = Utf8ToWide(dir);
+    std::ifstream f(wdir + L"\\tracks.txt");
     if (!f.is_open()) return meta;
     std::string line;
     while (std::getline(f, line)) {
@@ -456,13 +477,13 @@ void InputLoop() {
     freopen_s(&f, "CONOUT$", "w", stdout);
     freopen_s(&f, "CONOUT$", "w", stderr);
 
-    char pathBuffer[MAX_PATH];
-    if (GetModuleFileNameA(g_hModule, pathBuffer, MAX_PATH) == 0) {
+    wchar_t wPathBuffer[MAX_PATH];
+    if (GetModuleFileNameW(g_hModule, wPathBuffer, MAX_PATH) == 0) {
         std::cout << "[Mod] Error getting DLL path." << std::endl;
         return;
     }
 
-    std::string dllDir = pathBuffer;
+    std::string dllDir = WideToUtf8(wPathBuffer);
     size_t lastSlash = dllDir.find_last_of("\\/");
     if (lastSlash != std::string::npos)
         dllDir = dllDir.substr(0, lastSlash);
@@ -496,17 +517,20 @@ void InputLoop() {
     }
 
     std::string musicDir = dllDir + "\\music";
+    std::wstring wMusicDir = Utf8ToWide(musicDir);
     auto bgmMeta = ParseTrackMeta(musicDir);
 
-    for (const char* ext : { "\\*.wav", "\\*.mp3", "\\*.ogg", "\\*.adx", "\\*.brstm", "\\*.flac" }) {
-        WIN32_FIND_DATAA findData;
-        HANDLE hFind = FindFirstFileA((musicDir + ext).c_str(), &findData);
+    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac" }) {
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW((wMusicDir + ext).c_str(), &findData);
         if (hFind != INVALID_HANDLE_VALUE) {
             do {
-                std::string fullPath = musicDir + "\\" + findData.cFileName;
+                if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) continue;
+                std::string utf8Name = WideToUtf8(findData.cFileName);
+                std::string fullPath = musicDir + "\\" + utf8Name;
                 g_soundPaths.push_back(fullPath);
                 std::cout << "[Mod] Found: " << fullPath << std::endl;
-            } while (FindNextFileA(hFind, &findData));
+            } while (FindNextFileW(hFind, &findData));
             FindClose(hFind);
         }
     }
@@ -533,17 +557,20 @@ void InputLoop() {
     std::cout << "[Mod] Pre-loaded " << g_preloadedSounds.size() << " BGM sound(s)." << std::endl;
 
     std::string lobbyDir = dllDir + "\\music_lobby";
+    std::wstring wLobbyDir = Utf8ToWide(lobbyDir);
     auto lobbyMeta = ParseTrackMeta(lobbyDir);
-    for (const char* ext : { "\\*.wav", "\\*.mp3", "\\*.ogg", "\\*.adx", "\\*.brstm", "\\*.flac" }) {
-        WIN32_FIND_DATAA findData;
-        HANDLE hFind = FindFirstFileA((lobbyDir + ext).c_str(), &findData);
+    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac" }) {
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW((wLobbyDir + ext).c_str(), &findData);
         if (hFind != INVALID_HANDLE_VALUE) {
             do {
-                std::string fullPath = lobbyDir + "\\" + findData.cFileName;
+                if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) continue;
+                std::string utf8Name = WideToUtf8(findData.cFileName);
+                std::string fullPath = lobbyDir + "\\" + utf8Name;
                 WavData data;
                 if (AudioLoader::Load(fullPath, data)) {
                     NormalizePcm16(data);
-                    auto it = lobbyMeta.find(findData.cFileName);
+                    auto it = lobbyMeta.find(utf8Name);
                     TrackMeta tm;
                     if (it != lobbyMeta.end()) tm = it->second;
                     ScalePcm16(data, tm.volumeMul);
@@ -553,24 +580,27 @@ void InputLoop() {
                     g_preloadedLobbySounds.push_back(std::move(ti));
                 }
                 std::cout << "[Mod] Lobby: " << fullPath << std::endl;
-            } while (FindNextFileA(hFind, &findData));
+            } while (FindNextFileW(hFind, &findData));
             FindClose(hFind);
         }
     }
     std::cout << "[Mod] Pre-loaded " << g_preloadedLobbySounds.size() << " lobby sound(s)." << std::endl;
 
     std::string titleDir = dllDir + "\\music_title";
+    std::wstring wTitleDir = Utf8ToWide(titleDir);
     auto titleMeta = ParseTrackMeta(titleDir);
-    for (const char* ext : { "\\*.wav", "\\*.mp3", "\\*.ogg", "\\*.adx", "\\*.brstm", "\\*.flac" }) {
-        WIN32_FIND_DATAA findData;
-        HANDLE hFind = FindFirstFileA((titleDir + ext).c_str(), &findData);
+    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac" }) {
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW((wTitleDir + ext).c_str(), &findData);
         if (hFind != INVALID_HANDLE_VALUE) {
             do {
-                std::string fullPath = titleDir + "\\" + findData.cFileName;
+                if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) continue;
+                std::string utf8Name = WideToUtf8(findData.cFileName);
+                std::string fullPath = titleDir + "\\" + utf8Name;
                 WavData data;
                 if (AudioLoader::Load(fullPath, data)) {
                     NormalizePcm16(data);
-                    auto it = titleMeta.find(findData.cFileName);
+                    auto it = titleMeta.find(utf8Name);
                     TrackMeta tm;
                     if (it != titleMeta.end()) tm = it->second;
                     ScalePcm16(data, tm.volumeMul);
@@ -580,7 +610,7 @@ void InputLoop() {
                     g_preloadedTitleSounds.push_back(std::move(ti));
                 }
                 std::cout << "[Mod] Title: " << fullPath << std::endl;
-            } while (FindNextFileA(hFind, &findData));
+            } while (FindNextFileW(hFind, &findData));
             FindClose(hFind);
         }
     }
