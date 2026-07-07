@@ -44,7 +44,7 @@ public:
         hr = XAudio2Create(&pXAudio2, 0, XAUDIO2_DEFAULT_PROCESSOR);
         if (FAILED(hr)) return false;
 
-        hr = pXAudio2->CreateMasteringVoice(&pMasterVoice, 2);
+        hr = pXAudio2->CreateMasteringVoice(&pMasterVoice, XAUDIO2_DEFAULT_CHANNELS, XAUDIO2_DEFAULT_SAMPLERATE, 0, NULL, NULL, AudioCategory_GameEffects);
         if (FAILED(hr)) return false;
 
         return true;

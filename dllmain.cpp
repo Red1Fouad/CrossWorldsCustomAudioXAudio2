@@ -30,10 +30,11 @@ std::mutex g_playerMutex;
 
 AudioEngine* g_audio = nullptr;
 std::vector<std::string> g_soundPaths;
-std::vector<TrackInfo> g_preloadedSounds;
-std::vector<TrackInfo> g_preloadedLobbySounds;
-std::vector<TrackInfo> g_preloadedTitleSounds;
+std::vector<CompressedAudio> g_preloadedSounds;
+std::vector<CompressedAudio> g_preloadedLobbySounds;
+std::vector<CompressedAudio> g_preloadedTitleSounds;
 std::atomic<bool> g_playedFinish{ false };
+std::atomic<bool> g_bgmActive{ false };
 bool g_playNewMusic = false;
 bool g_muteOnUnfocus = false;
 int g_activePool = 0; // 0=bgm, 1=lobby, 2=title
@@ -47,36 +48,12 @@ std::vector<int> g_titleOrder;
 int g_titleOrderPos = 0;
 std::mt19937 g_rng(std::random_device{}());
 
-void NormalizePcm16(WavData& data) {
-    if (data.audioData.empty() || data.wfx.wBitsPerSample != 16) return;
-    int16_t* samples = reinterpret_cast<int16_t*>(data.audioData.data());
-    size_t count = data.audioData.size() / 2;
-    int16_t peak = 0;
-    for (size_t i = 0; i < count; i++) {
-        int16_t s = samples[i];
-        if (s < 0) s = -s;
-        if (s > peak) peak = s;
-    }
-    if (peak == 0) return;
-    float gain = (0.90f * 32767.0f) / (float)peak;
-    for (size_t i = 0; i < count; i++) {
-        float scaled = samples[i] * gain;
-        if (scaled > 32767.0f) scaled = 32767.0f;
-        if (scaled < -32768.0f) scaled = -32768.0f;
-        samples[i] = (int16_t)scaled;
-    }
-}
-
-void ScalePcm16(WavData& data, float mul) {
-    if (data.audioData.empty() || data.wfx.wBitsPerSample != 16 || mul == 1.0f) return;
-    int16_t* s = reinterpret_cast<int16_t*>(data.audioData.data());
-    size_t cnt = data.audioData.size() / 2;
-    for (size_t i = 0; i < cnt; i++) {
-        float v = s[i] * mul;
-        if (v > 32767.0f) v = 32767.0f;
-        if (v < -32768.0f) v = -32768.0f;
-        s[i] = (int16_t)v;
-    }
+void PlayCompressed(CompressedAudio& audio, float volume, int categoryId, bool allowLoop = true) {
+    WavData data;
+    if (!AudioLoader::DecodeToPcm(audio, data)) return;
+    AudioLoader::NormalizePcm16(data);
+    AudioLoader::ScalePcm16(data, audio.volumeMul);
+    g_audio->PlayPreloaded(data, volume, categoryId, allowLoop);
 }
 
 static std::string WideToUtf8(const wchar_t* wide) {
@@ -136,7 +113,7 @@ std::map<std::string, TrackMeta> ParseTrackMeta(const std::string& dir) {
     return meta;
 }
 
-void BuildShuffleOrder(std::vector<int>& order, const std::vector<TrackInfo>& pool) {
+void BuildShuffleOrder(std::vector<int>& order, const std::vector<CompressedAudio>& pool) {
     order.clear();
     if (pool.empty()) return;
     std::vector<int> remaining;
@@ -165,7 +142,7 @@ void BuildShuffleOrder(std::vector<int>& order, const std::vector<TrackInfo>& po
     }
 }
 
-int GetNextShuffledIndex(std::vector<TrackInfo>& pool, std::vector<int>& order, int& pos) {
+int GetNextShuffledIndex(std::vector<CompressedAudio>& pool, std::vector<int>& order, int& pos) {
     if (pool.empty()) return -1;
     if (pos >= (int)order.size()) {
         BuildShuffleOrder(order, pool);
@@ -303,12 +280,16 @@ uint32_t Hook_Start(void* player) {
         if (g_playedFinish.compare_exchange_strong(expected, true)) {
             if (g_audio) g_audio->StopCategory(0);
             if (fpCategorySetVolume) fpCategorySetVolume(0, g_originalBgmVolume);
+            g_activePool = 0;
+            g_bgmActive.store(false);
             std::cout << "[Mod] Stopped custom BGM, restored cat 0 to " << g_originalBgmVolume << std::endl;
         }
     }
 
     if (name.find("BGM_") == 0) {
-        if (name == "BGM_MONSTERTRUCK_01") {
+        if (name == "BGM_MONSTERTRUCK_01" || name == "BGM_TOP_MENU" ||
+            name.find("BGM_CHARASELECT_") == 0 || name.find("BGM_GARAGE_") == 0 ||
+            name.find("BGM_PARTYRACE_") == 0 || name.find("BGM_PREVIEW_") == 0) {
             return 0;
         }
 
@@ -333,7 +314,7 @@ uint32_t Hook_Start(void* player) {
             if (g_audio) g_audio->StopCategory(0);
         }
 
-        auto getPool = [&](int pid) -> std::vector<TrackInfo>& {
+        auto getPool = [&](int pid) -> std::vector<CompressedAudio>& {
             if (pid == 1) return g_preloadedLobbySounds;
             if (pid == 2) return g_preloadedTitleSounds;
             return g_preloadedSounds;
@@ -354,6 +335,10 @@ uint32_t Hook_Start(void* player) {
         const char* poolName = poolId == 1 ? "lobby" : poolId == 2 ? "title" : "BGM";
 
         if (isCustomBgm && !pool.empty()) {
+            if (poolId == g_activePool && g_bgmActive.load()) {
+                std::cout << "[Mod] Same pool (" << poolName << ") already active, keeping current track." << std::endl;
+                return fpStartOriginal ? fpStartOriginal(player) : 0;
+            }
             if (g_audio) g_audio->StopCategory(0);
             g_activePool = poolId;
             g_playedFinish.store(false);
@@ -362,7 +347,8 @@ uint32_t Hook_Start(void* player) {
             if (fpCategorySetVolume) fpCategorySetVolume(0, 0.0f);
             std::cout << "[Mod] Muted cat 0 (was " << g_originalBgmVolume << "), playing " << poolName << " music." << std::endl;
             int idx = GetNextShuffledIndex(pool, order, pos);
-            g_audio->PlayPreloaded(pool[idx].data, g_customBgmVolume, 0, !g_playNewMusic);
+            PlayCompressed(pool[idx], g_customBgmVolume, 0, !g_playNewMusic);
+            g_bgmActive.store(true);
         }
     }
 
@@ -447,7 +433,8 @@ void InputLoop() {
     g_audio = &audio;
     audio.m_onBgmFinished = []() {
         if (g_playedFinish.load()) return;
-        auto getPool = [](int pid) -> std::vector<TrackInfo>& {
+        g_bgmActive.store(false);
+        auto getPool = [](int pid) -> std::vector<CompressedAudio>& {
             if (pid == 1) return g_preloadedLobbySounds;
             if (pid == 2) return g_preloadedTitleSounds;
             return g_preloadedSounds;
@@ -468,7 +455,8 @@ void InputLoop() {
         auto& pos = getPos(g_activePool);
         if (pool.empty()) return;
         int idx = GetNextShuffledIndex(pool, order, pos);
-        g_audio->PlayPreloaded(pool[idx].data, g_customBgmVolume, 0, false);
+        PlayCompressed(pool[idx], g_customBgmVolume, 0, false);
+        g_bgmActive.store(true);
         std::cout << "[Mod] PlayNewMusic: shuffled to next " << poolName << " track." << std::endl;
     };
 
@@ -520,7 +508,7 @@ void InputLoop() {
     std::wstring wMusicDir = Utf8ToWide(musicDir);
     auto bgmMeta = ParseTrackMeta(musicDir);
 
-    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac" }) {
+    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac", L"\\*.aac", L"\\*.m4a" }) {
         WIN32_FIND_DATAW findData;
         HANDLE hFind = FindFirstFileW((wMusicDir + ext).c_str(), &findData);
         if (hFind != INVALID_HANDLE_VALUE) {
@@ -538,20 +526,17 @@ void InputLoop() {
         std::cout << "[Mod] No music files found in 'music' folder!" << std::endl;
 
     for (const auto& path : g_soundPaths) {
-        WavData data;
-        if (AudioLoader::Load(path, data)) {
-            NormalizePcm16(data);
+        CompressedAudio ca;
+        if (AudioLoader::LoadCompressed(path, ca)) {
             std::string fname = path;
             size_t bs = fname.find_last_of("\\/");
             if (bs != std::string::npos) fname = fname.substr(bs + 1);
             auto it = bgmMeta.find(fname);
             TrackMeta tm;
             if (it != bgmMeta.end()) tm = it->second;
-            ScalePcm16(data, tm.volumeMul);
-            TrackInfo ti;
-            ti.data = std::move(data);
-            ti.weight = tm.weight;
-            g_preloadedSounds.push_back(std::move(ti));
+            ca.weight = tm.weight;
+            ca.volumeMul = tm.volumeMul;
+            g_preloadedSounds.push_back(std::move(ca));
         }
     }
     std::cout << "[Mod] Pre-loaded " << g_preloadedSounds.size() << " BGM sound(s)." << std::endl;
@@ -559,7 +544,7 @@ void InputLoop() {
     std::string lobbyDir = dllDir + "\\music_lobby";
     std::wstring wLobbyDir = Utf8ToWide(lobbyDir);
     auto lobbyMeta = ParseTrackMeta(lobbyDir);
-    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac" }) {
+    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac", L"\\*.aac", L"\\*.m4a" }) {
         WIN32_FIND_DATAW findData;
         HANDLE hFind = FindFirstFileW((wLobbyDir + ext).c_str(), &findData);
         if (hFind != INVALID_HANDLE_VALUE) {
@@ -567,17 +552,14 @@ void InputLoop() {
                 if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) continue;
                 std::string utf8Name = WideToUtf8(findData.cFileName);
                 std::string fullPath = lobbyDir + "\\" + utf8Name;
-                WavData data;
-                if (AudioLoader::Load(fullPath, data)) {
-                    NormalizePcm16(data);
+                CompressedAudio ca;
+                if (AudioLoader::LoadCompressed(fullPath, ca)) {
                     auto it = lobbyMeta.find(utf8Name);
                     TrackMeta tm;
                     if (it != lobbyMeta.end()) tm = it->second;
-                    ScalePcm16(data, tm.volumeMul);
-                    TrackInfo ti;
-                    ti.data = std::move(data);
-                    ti.weight = tm.weight;
-                    g_preloadedLobbySounds.push_back(std::move(ti));
+                    ca.weight = tm.weight;
+                    ca.volumeMul = tm.volumeMul;
+                    g_preloadedLobbySounds.push_back(std::move(ca));
                 }
                 std::cout << "[Mod] Lobby: " << fullPath << std::endl;
             } while (FindNextFileW(hFind, &findData));
@@ -589,7 +571,7 @@ void InputLoop() {
     std::string titleDir = dllDir + "\\music_title";
     std::wstring wTitleDir = Utf8ToWide(titleDir);
     auto titleMeta = ParseTrackMeta(titleDir);
-    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac" }) {
+    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac", L"\\*.aac", L"\\*.m4a" }) {
         WIN32_FIND_DATAW findData;
         HANDLE hFind = FindFirstFileW((wTitleDir + ext).c_str(), &findData);
         if (hFind != INVALID_HANDLE_VALUE) {
@@ -597,17 +579,14 @@ void InputLoop() {
                 if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) continue;
                 std::string utf8Name = WideToUtf8(findData.cFileName);
                 std::string fullPath = titleDir + "\\" + utf8Name;
-                WavData data;
-                if (AudioLoader::Load(fullPath, data)) {
-                    NormalizePcm16(data);
+                CompressedAudio ca;
+                if (AudioLoader::LoadCompressed(fullPath, ca)) {
                     auto it = titleMeta.find(utf8Name);
                     TrackMeta tm;
                     if (it != titleMeta.end()) tm = it->second;
-                    ScalePcm16(data, tm.volumeMul);
-                    TrackInfo ti;
-                    ti.data = std::move(data);
-                    ti.weight = tm.weight;
-                    g_preloadedTitleSounds.push_back(std::move(ti));
+                    ca.weight = tm.weight;
+                    ca.volumeMul = tm.volumeMul;
+                    g_preloadedTitleSounds.push_back(std::move(ca));
                 }
                 std::cout << "[Mod] Title: " << fullPath << std::endl;
             } while (FindNextFileW(hFind, &findData));
@@ -668,7 +647,7 @@ void InputLoop() {
                 }
             }
             if (curRight && !prevRight) {
-                auto getPool = [](int pid) -> std::vector<TrackInfo>& {
+                auto getPool = [](int pid) -> std::vector<CompressedAudio>& {
                     if (pid == 1) return g_preloadedLobbySounds;
                     if (pid == 2) return g_preloadedTitleSounds;
                     return g_preloadedSounds;
@@ -690,12 +669,13 @@ void InputLoop() {
                 if (!pool.empty()) {
                     int idx = GetNextShuffledIndex(pool, order, pos);
                     audio.StopCategoryImmediate(0);
-                    audio.PlayPreloaded(pool[idx].data, g_customBgmVolume, 0, !g_playNewMusic);
+                    PlayCompressed(pool[idx], g_customBgmVolume, 0, !g_playNewMusic);
+                    g_bgmActive.store(true);
                     std::cout << "[Mod] Skip -> " << poolName << " track." << std::endl;
                 }
             }
             if (curLeft && !prevLeft) {
-                auto getPool = [](int pid) -> std::vector<TrackInfo>& {
+                auto getPool = [](int pid) -> std::vector<CompressedAudio>& {
                     if (pid == 1) return g_preloadedLobbySounds;
                     if (pid == 2) return g_preloadedTitleSounds;
                     return g_preloadedSounds;
@@ -717,7 +697,8 @@ void InputLoop() {
                 if (!pool.empty() && pos > 0) {
                     int curIdx = order[pos - 1];
                     audio.StopCategoryImmediate(0);
-                    audio.PlayPreloaded(pool[curIdx].data, g_customBgmVolume, 0, !g_playNewMusic);
+                    PlayCompressed(pool[curIdx], g_customBgmVolume, 0, !g_playNewMusic);
+                    g_bgmActive.store(true);
                     std::cout << "[Mod] Restart current " << poolName << " track." << std::endl;
                 }
             }
