@@ -28,6 +28,7 @@
 #define ENABLE_AAC
 #endif
 
+
 struct WavData {
     WAVEFORMATEX wfx;
     std::vector<BYTE> audioData;
@@ -44,6 +45,7 @@ struct TrackInfo {
 struct CompressedAudio {
     std::vector<uint8_t> data;
     std::string extension;
+    std::string filename;
     float weight = 1.0f;
     float volumeMul = 1.0f;
 };
@@ -86,6 +88,7 @@ public:
         std::vector<uint8_t> fileData;
         if (!ReadFileIntoMemory(filename, fileData)) return false;
         out.data = std::move(fileData);
+        out.filename = filename;
         size_t dot = filename.find_last_of(".");
         if (dot != std::string::npos) {
             out.extension = filename.substr(dot);
@@ -103,6 +106,7 @@ public:
         if (ext == ".adx") return DecodeAdxMemory(input.data, outData);
         if (ext == ".brstm") return DecodeBrstmMemory(input.data, outData);
         if (ext == ".aac" || ext == ".m4a") return DecodeAacMemory(input.data, outData);
+        if (ext == ".aax") return DecodeAaxMemory(input.data, outData);
         return false;
     }
 
@@ -151,6 +155,9 @@ public:
             std::cout << "[AudioLoader] Error: AAC support not compiled (Helix AAC missing)." << std::endl;
             return false;
 #endif
+        }
+        else if (ext == ".aax") {
+            return LoadAax(filename, outData);
         }
         else {
             return LoadWav(filename, outData);
@@ -871,4 +878,135 @@ private:
         return true;
     }
 #endif
+
+    // ---- AAX (CRI @UTF container with ADX subfiles) ----
+
+    static uint32_t UtfReadBE32(const uint8_t* p) {
+        return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+    }
+    static uint16_t UtfReadBE16(const uint8_t* p) {
+        return ((uint16_t)p[0] << 8) | p[1];
+    }
+
+    static bool DecodeAaxMemory(const std::vector<uint8_t>& fileData, WavData& outData) {
+        if (fileData.size() < 0x20) return false;
+        if (memcmp(fileData.data(), "@UTF", 4) != 0) {
+            std::cout << "[AudioLoader] AAX: Invalid @UTF header." << std::endl;
+            return false;
+        }
+
+        uint32_t tableSize = UtfReadBE32(fileData.data() + 4) + 8;
+        if (tableSize > fileData.size()) {
+            std::cout << "[AudioLoader] AAX: Table size exceeds file." << std::endl;
+            return false;
+        }
+
+        uint16_t rowsOff = UtfReadBE16(fileData.data() + 0x0A);
+        uint32_t stringsOff = UtfReadBE32(fileData.data() + 0x0C);
+        uint32_t dataOff = UtfReadBE32(fileData.data() + 0x10);
+        uint16_t numCols = UtfReadBE16(fileData.data() + 0x18);
+        uint16_t rowWidth = UtfReadBE16(fileData.data() + 0x1A);
+        uint32_t numRows = UtfReadBE32(fileData.data() + 0x1C);
+
+        size_t absRows = rowsOff + 8;
+        size_t absStrings = stringsOff + 8;
+        size_t absData = dataOff + 8;
+
+        struct ColInfo { bool hasName; bool isDefault; bool isRow; uint8_t type; uint32_t strOff; };
+        std::vector<ColInfo> cols(numCols);
+        size_t schemaPos = 0x20;
+        for (uint16_t c = 0; c < numCols; c++) {
+            if (schemaPos + 5 > fileData.size()) return false;
+            uint8_t info = fileData[schemaPos];
+            cols[c].hasName = (info & 0x10) != 0;
+            cols[c].isDefault = (info & 0x20) != 0;
+            cols[c].isRow = (info & 0x40) != 0;
+            cols[c].type = info & 0x0F;
+            cols[c].strOff = UtfReadBE32(fileData.data() + schemaPos + 1);
+            schemaPos += 5;
+        }
+
+        int dataColIdx = -1;
+        for (uint16_t c = 0; c < numCols; c++) {
+            if (cols[c].hasName) {
+                size_t namePos = absStrings + cols[c].strOff;
+                if (namePos + 4 <= fileData.size()) {
+                    if (memcmp(fileData.data() + namePos, "data", 4) == 0) {
+                        dataColIdx = c;
+                        break;
+                    }
+                }
+            }
+        }
+        if (dataColIdx < 0) {
+            std::cout << "[AudioLoader] AAX: 'data' column not found." << std::endl;
+            return false;
+        }
+
+        std::vector<WavData> segments;
+        for (uint32_t row = 0; row < numRows; row++) {
+            size_t rowBase = absRows + row * rowWidth;
+            size_t colOffset = 0;
+            for (int c = 0; c < dataColIdx && c < (int)numCols; c++) {
+                switch (cols[c].type) {
+                case 0x00: case 0x01: colOffset += 1; break;
+                case 0x02: case 0x03: colOffset += 2; break;
+                case 0x04: case 0x05: case 0x08: colOffset += 4; break;
+                case 0x0A: colOffset += 8; break;
+                case 0x0B: colOffset += 8; break;
+                default: colOffset += 4; break;
+                }
+            }
+            size_t vldPos = rowBase + colOffset;
+            if (vldPos + 8 > fileData.size()) continue;
+            uint32_t segOffset = UtfReadBE32(fileData.data() + vldPos);
+            uint32_t segSize = UtfReadBE32(fileData.data() + vldPos + 4);
+
+            if (absData + segOffset + segSize > fileData.size()) continue;
+            const uint8_t* segPtr = fileData.data() + absData + segOffset;
+
+            std::vector<uint8_t> adxData(segPtr, segPtr + segSize);
+            WavData segWav;
+            if (DecodeAdxMemory(adxData, segWav)) {
+                segments.push_back(std::move(segWav));
+            }
+        }
+
+        if (segments.empty()) {
+            std::cout << "[AudioLoader] AAX: No valid ADX segments found." << std::endl;
+            return false;
+        }
+
+        outData.wfx = segments[0].wfx;
+        outData.hasLoop = false;
+        outData.loopBegin = 0;
+        outData.loopLength = 0;
+
+        size_t totalSamples = 0;
+        for (auto& seg : segments) {
+            size_t segSamples = seg.audioData.size() / (seg.wfx.nChannels * (seg.wfx.wBitsPerSample / 8));
+            if (seg.hasLoop) {
+                outData.hasLoop = true;
+                outData.loopBegin = (UINT32)totalSamples + seg.loopBegin;
+                outData.loopLength = seg.loopLength;
+            }
+            totalSamples += segSamples;
+        }
+
+        size_t bytesPerSample = outData.wfx.nChannels * (outData.wfx.wBitsPerSample / 8);
+        outData.audioData.resize(totalSamples * bytesPerSample);
+        size_t writePos = 0;
+        for (auto& seg : segments) {
+            memcpy(outData.audioData.data() + writePos, seg.audioData.data(), seg.audioData.size());
+            writePos += seg.audioData.size();
+        }
+
+        return true;
+    }
+
+    static bool LoadAax(const std::string& filename, WavData& outData) {
+        std::vector<uint8_t> fileData;
+        if (!ReadFileIntoMemory(filename, fileData)) return false;
+        return DecodeAaxMemory(fileData, outData);
+    }
 };

@@ -49,6 +49,9 @@ int g_titleOrderPos = 0;
 std::mt19937 g_rng(std::random_device{}());
 
 void PlayCompressed(CompressedAudio& audio, float volume, int categoryId, bool allowLoop = true) {
+    size_t bs = audio.filename.find_last_of("\\/");
+    std::string fname = (bs != std::string::npos) ? audio.filename.substr(bs + 1) : audio.filename;
+    std::cout << "[Mod] Playing: " << fname << std::endl;
     WavData data;
     if (!AudioLoader::DecodeToPcm(audio, data)) return;
     AudioLoader::NormalizePcm16(data);
@@ -263,18 +266,6 @@ uint32_t Hook_Start(void* player) {
             acbFile = g_playerAcbFiles[player];
     }
 
-    if (name.find("SE_FINISH") == 0 || name.find("BGM_") == 0) {
-        std::stringstream ss;
-        ss << "[Mod] CRI Start -> Cue: " << name;
-        if (!acbFile.empty()) ss << " | ACB: " << acbFile;
-        if (fpCategoryGetVolume) {
-            if (catId != -1) ss << " | PlayerCat(" << catId << "): " << fpCategoryGetVolume(catId);
-            ss << " | Cats:";
-            for (int i = 0; i < 16; ++i) ss << " [" << i << "]:" << fpCategoryGetVolume(i);
-        }
-        std::cout << ss.str() << std::endl;
-    }
-
     if (name.find("SE_FINISH") == 0) {
         bool expected = false;
         if (g_playedFinish.compare_exchange_strong(expected, true)) {
@@ -312,6 +303,8 @@ uint32_t Hook_Start(void* player) {
         if (!isCustomBgm) {
             if (fpCategorySetVolume) fpCategorySetVolume(0, g_originalBgmVolume);
             if (g_audio) g_audio->StopCategory(0);
+            if (fpStartOriginal) return fpStartOriginal(player);
+            return 0;
         }
 
         auto getPool = [&](int pid) -> std::vector<CompressedAudio>& {
@@ -334,9 +327,8 @@ uint32_t Hook_Start(void* player) {
         auto& pos = getPos(poolId);
         const char* poolName = poolId == 1 ? "lobby" : poolId == 2 ? "title" : "BGM";
 
-        if (isCustomBgm && !pool.empty()) {
+        if (!pool.empty()) {
             if (poolId == g_activePool && g_bgmActive.load()) {
-                std::cout << "[Mod] Same pool (" << poolName << ") already active, keeping current track." << std::endl;
                 return fpStartOriginal ? fpStartOriginal(player) : 0;
             }
             if (g_audio) g_audio->StopCategory(0);
@@ -358,23 +350,6 @@ uint32_t Hook_Start(void* player) {
 
 void InitHooks() {
     HMODULE hGame = GetModuleHandleA(nullptr);
-
-    if (MH_Initialize() != MH_OK) { std::cout << "[Mod] MinHook Init failed.\n"; return; }
-
-    const char* sigSetCueName = "48 89 5C 24 ?? 48 89 6C 24 ?? 56 57 41 56 48 83 EC 20 45 33 F6 49 8B F0";
-    uintptr_t addrSetCueName = PatternScan(hGame, sigSetCueName);
-    if (addrSetCueName) {
-        std::cout << "[Mod] Found criAtomExPlayer_SetCueName at: " << (void*)addrSetCueName << std::endl;
-        if (MH_CreateHook((void*)addrSetCueName, &Hook_SetCueName, (void**)&fpSetCueNameOriginal) != MH_OK) {
-            std::cout << "[Mod] CreateHook failed.\n"; return;
-        }
-        if (MH_EnableHook((void*)addrSetCueName) != MH_OK) {
-            std::cout << "[Mod] EnableHook failed.\n"; return;
-        }
-        std::cout << "[Mod] SetCueName Hook enabled!\n";
-    } else {
-        std::cout << "[Mod] Failed to find signature for criAtomExPlayer_SetCueName.\n";
-    }
 
     const char* sigSetCat = "48 89 5C 24 ?? 48 89 6C 24 ?? 48 89 74 24 ?? 57 48 83 EC 50 48 8B D9 8B FA";
     uintptr_t addrSetCat = PatternScan(hGame, sigSetCat);
@@ -508,7 +483,7 @@ void InputLoop() {
     std::wstring wMusicDir = Utf8ToWide(musicDir);
     auto bgmMeta = ParseTrackMeta(musicDir);
 
-    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac", L"\\*.aac", L"\\*.m4a" }) {
+    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac", L"\\*.aac", L"\\*.m4a", L"\\*.aax" }) {
         WIN32_FIND_DATAW findData;
         HANDLE hFind = FindFirstFileW((wMusicDir + ext).c_str(), &findData);
         if (hFind != INVALID_HANDLE_VALUE) {
@@ -544,7 +519,7 @@ void InputLoop() {
     std::string lobbyDir = dllDir + "\\music_lobby";
     std::wstring wLobbyDir = Utf8ToWide(lobbyDir);
     auto lobbyMeta = ParseTrackMeta(lobbyDir);
-    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac", L"\\*.aac", L"\\*.m4a" }) {
+    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac", L"\\*.aac", L"\\*.m4a", L"\\*.aax" }) {
         WIN32_FIND_DATAW findData;
         HANDLE hFind = FindFirstFileW((wLobbyDir + ext).c_str(), &findData);
         if (hFind != INVALID_HANDLE_VALUE) {
@@ -571,7 +546,7 @@ void InputLoop() {
     std::string titleDir = dllDir + "\\music_title";
     std::wstring wTitleDir = Utf8ToWide(titleDir);
     auto titleMeta = ParseTrackMeta(titleDir);
-    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac", L"\\*.aac", L"\\*.m4a" }) {
+    for (const wchar_t* ext : { L"\\*.wav", L"\\*.mp3", L"\\*.ogg", L"\\*.adx", L"\\*.brstm", L"\\*.flac", L"\\*.aac", L"\\*.m4a", L"\\*.aax" }) {
         WIN32_FIND_DATAW findData;
         HANDLE hFind = FindFirstFileW((wTitleDir + ext).c_str(), &findData);
         if (hFind != INVALID_HANDLE_VALUE) {
@@ -727,6 +702,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     case DLL_PROCESS_ATTACH:
         g_hModule = hModule;
         DisableThreadLibraryCalls(hModule);
+        if (MH_Initialize() == MH_OK) {
+            HMODULE hGame = GetModuleHandleA(nullptr);
+            const char* sigSetCueName = "48 89 5C 24 ?? 48 89 6C 24 ?? 56 57 41 56 48 83 EC 20 45 33 F6 49 8B F0";
+            uintptr_t addrSetCueName = PatternScan(hGame, sigSetCueName);
+            if (addrSetCueName) {
+                if (MH_CreateHook((void*)addrSetCueName, &Hook_SetCueName, (void**)&fpSetCueNameOriginal) == MH_OK)
+                    MH_EnableHook((void*)addrSetCueName);
+            }
+        }
         break;
     case DLL_PROCESS_DETACH:
         bIsRunning = false;
