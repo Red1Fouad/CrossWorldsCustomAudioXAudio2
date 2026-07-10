@@ -22,6 +22,7 @@ class AudioEngine {
 private:
     IXAudio2* pXAudio2 = nullptr;
     IXAudio2MasteringVoice* pMasterVoice = nullptr;
+    bool m_ownsDevice = false;
     std::vector<ActiveVoice> m_voices;
     std::mutex m_mutex;
 
@@ -33,11 +34,20 @@ public:
     ~AudioEngine() {
         StopAll();
         if (pMasterVoice) pMasterVoice->DestroyVoice();
-        if (pXAudio2) pXAudio2->Release();
-        CoUninitialize();
+        if (pXAudio2 && m_ownsDevice) pXAudio2->Release();
+        if (m_ownsDevice) CoUninitialize();
     }
 
     bool Init() {
+        extern IXAudio2* g_gameXAudio2;
+        if (g_gameXAudio2) {
+            pXAudio2 = g_gameXAudio2;
+            m_ownsDevice = false;
+            std::cout << "[Mod] Using game's XAudio2 instance." << std::endl;
+            return true;
+        }
+
+        m_ownsDevice = true;
         HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (FAILED(hr)) return false;
 

@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <random>
+#include <set>
 #include "AudioEngine.h"
 #include "MinHook.h"
 
@@ -21,6 +22,7 @@
 
 std::atomic<bool> bIsRunning{ false };
 HMODULE g_hModule = nullptr;
+IXAudio2* g_gameXAudio2 = nullptr;
 
 std::map<void*, std::string> g_playerCueNames;
 std::map<void*, int> g_playerCategoryIds;
@@ -214,8 +216,19 @@ void Hook_SetCueName(void* player, void* acb, const char* cueName) {
             g_playerAcbFiles[player] = g_acbFiles[acb];
         else
             g_playerAcbFiles[player] = "Unknown (Memory/Data)";
-        if (strncmp(safeName, "BGM_", 4) == 0 || strncmp(safeName, "SE_FINISH", 9) == 0)
-            std::cout << "[Mod] CRI SetCueName: " << safeName << std::endl;
+        if (strncmp(safeName, "BGM_", 4) == 0 || strncmp(safeName, "SE_FINISH", 9) == 0) {
+            bool blocked = (strcmp(safeName, "BGM_MONSTERTRUCK_01") == 0 || strcmp(safeName, "BGM_TOP_MENU") == 0 ||
+                strncmp(safeName, "BGM_CHARASELECT_", 16) == 0 || strncmp(safeName, "BGM_GARAGE_", 11) == 0 ||
+                strncmp(safeName, "BGM_PARTYRACE_", 14) == 0 || strncmp(safeName, "BGM_PREVIEW_", 12) == 0 ||
+                strncmp(safeName, "BGM_LISTEN_", 11) == 0);
+            static std::set<std::string> loggedBlocked;
+            if (blocked) {
+                if (loggedBlocked.insert(safeName).second)
+                    std::cout << "[Mod] " << safeName << " (Blocked)" << std::endl;
+            } else {
+                std::cout << "[Mod] CRI SetCueName: " << safeName << std::endl;
+            }
+        }
     }
     if (fpSetCueNameOriginal) fpSetCueNameOriginal(player, acb, cueName);
 }
@@ -249,6 +262,20 @@ criAtomExCategory_SetVolume_t fpCategorySetVolume = nullptr;
 typedef float (*criAtomExCategory_GetVolume_t)(int id);
 criAtomExCategory_GetVolume_t fpCategoryGetVolume = nullptr;
 
+// XAudio2Create hook - capture game's IXAudio2 instance
+typedef HRESULT(WINAPI* XAudio2Create_t)(IXAudio2** ppXAudio2, UINT32 Flags, XAUDIO2_PROCESSOR XAudio2Processor);
+XAudio2Create_t fpXAudio2CreateOriginal = nullptr;
+
+HRESULT WINAPI Hook_XAudio2Create(IXAudio2** ppXAudio2, UINT32 Flags, XAUDIO2_PROCESSOR XAudio2Processor) {
+    HRESULT hr = fpXAudio2CreateOriginal(ppXAudio2, Flags, XAudio2Processor);
+    if (SUCCEEDED(hr) && ppXAudio2 && *ppXAudio2 && !g_gameXAudio2) {
+        g_gameXAudio2 = *ppXAudio2;
+        g_gameXAudio2->AddRef();
+        std::cout << "[Mod] Captured game's IXAudio2: " << (void*)g_gameXAudio2 << std::endl;
+    }
+    return hr;
+}
+
 typedef uint32_t (*criAtomExPlayer_Start_t)(void* player);
 criAtomExPlayer_Start_t fpStartOriginal = nullptr;
 
@@ -273,14 +300,15 @@ uint32_t Hook_Start(void* player) {
             if (fpCategorySetVolume) fpCategorySetVolume(0, g_originalBgmVolume);
             g_activePool = 0;
             g_bgmActive.store(false);
-            std::cout << "[Mod] Stopped custom BGM, restored cat 0 to " << g_originalBgmVolume << std::endl;
+            std::cout << "[Mod] SE_FINISH → Stopped custom BGM, restored cat 0" << std::endl;
         }
     }
 
     if (name.find("BGM_") == 0) {
         if (name == "BGM_MONSTERTRUCK_01" || name == "BGM_TOP_MENU" ||
             name.find("BGM_CHARASELECT_") == 0 || name.find("BGM_GARAGE_") == 0 ||
-            name.find("BGM_PARTYRACE_") == 0 || name.find("BGM_PREVIEW_") == 0) {
+            name.find("BGM_PARTYRACE_") == 0 || name.find("BGM_PREVIEW_") == 0 ||
+            name.find("BGM_LISTEN_") == 0) {
             return 0;
         }
 
@@ -301,8 +329,10 @@ uint32_t Hook_Start(void* player) {
         bool isCustomBgm = (name == "BGM_LAP1" || name == "BGM_LAP2_FORCE" || isGpFinal() || poolId != 0);
 
         if (!isCustomBgm) {
+            std::cout << "[Mod] " << name << " (Silenced)" << std::endl;
             if (fpCategorySetVolume) fpCategorySetVolume(0, g_originalBgmVolume);
             if (g_audio) g_audio->StopCategory(0);
+            g_bgmActive.store(false);
             if (fpStartOriginal) return fpStartOriginal(player);
             return 0;
         }
@@ -329,6 +359,7 @@ uint32_t Hook_Start(void* player) {
 
         if (!pool.empty()) {
             if (poolId == g_activePool && g_bgmActive.load()) {
+                std::cout << "[Mod] " << name << " → " << poolName << " (Already playing, skipped)" << std::endl;
                 return fpStartOriginal ? fpStartOriginal(player) : 0;
             }
             if (g_audio) g_audio->StopCategory(0);
@@ -337,7 +368,7 @@ uint32_t Hook_Start(void* player) {
             float curVol = fpCategoryGetVolume ? fpCategoryGetVolume(0) : 1.0f;
             if (curVol > 0.0f) g_originalBgmVolume = curVol;
             if (fpCategorySetVolume) fpCategorySetVolume(0, 0.0f);
-            std::cout << "[Mod] Muted cat 0 (was " << g_originalBgmVolume << "), playing " << poolName << " music." << std::endl;
+            std::cout << "[Mod] " << name << " → " << poolName << " (Playing custom)" << std::endl;
             int idx = GetNextShuffledIndex(pool, order, pos);
             PlayCompressed(pool[idx], g_customBgmVolume, 0, !g_playNewMusic);
             g_bgmActive.store(true);
@@ -709,6 +740,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             if (addrSetCueName) {
                 if (MH_CreateHook((void*)addrSetCueName, &Hook_SetCueName, (void**)&fpSetCueNameOriginal) == MH_OK)
                     MH_EnableHook((void*)addrSetCueName);
+            }
+        }
+        {
+            HMODULE hXAudio2 = GetModuleHandleA("xaudio2.dll");
+            if (!hXAudio2) hXAudio2 = LoadLibraryA("xaudio2.dll");
+            if (hXAudio2) {
+                auto pXAudio2Create = GetProcAddress(hXAudio2, "XAudio2Create");
+                if (pXAudio2Create) {
+                    if (MH_CreateHook((void*)pXAudio2Create, &Hook_XAudio2Create, (void**)&fpXAudio2CreateOriginal) == MH_OK)
+                        MH_EnableHook((void*)pXAudio2Create);
+                    std::cout << "[Mod] Hooked XAudio2Create" << std::endl;
+                }
             }
         }
         break;
