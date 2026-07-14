@@ -118,7 +118,7 @@ The mod is a DLL that hooks into the game at runtime:
 
 ### Special Thanks
 
-- **RyoTune** — This project would not have been possible without his work. The [RyoFramework](https://github.com/RyoTune/RyoFramework) provided invaluable information about the game's audio system that was essential to the development of this mod.
+- **RyoTune** — This project would not have been possible without his work. The [RyoFramework](https://github.com/RyoTune/SRC.RyoFramework) provided invaluable information about the game's audio system that was essential to the development of this mod.
 
 ### Mod Author
 
