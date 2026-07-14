@@ -116,6 +116,10 @@ The mod is a DLL that hooks into the game at runtime:
 
 ## Credits
 
+### Special Thanks
+
+- **RyoTune** — This project would not have been possible without his work. The [RyoFramework](https://github.com/RyoTune/RyoFramework) provided invaluable information about the game's audio system that was essential to the development of this mod.
+
 ### Mod Author
 
 - **Red1Fouad** — [GitHub](https://github.com/Red1Fouad)
