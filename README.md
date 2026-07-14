@@ -12,18 +12,20 @@ A BGM replacement mod for **Sonic Racing CrossWorlds** that lets you play your o
 2. Place the mod files so the structure looks like this:
 
 ```
-SonicRacingCrossWorlds/
+<Steam>/steamapps/common/SonicRacingCrossWorlds/
   UNION/
     Binaries/
       Win64/
         ue4ss/
           Mods/
             AudioDLL/
-              main.dll
-              settings.txt        (auto-generated on first run)
-              music/              (race BGM)
-              music_lobby/        (lobby BGM)
-              music_title/        (title screen BGM)
+              dlls/
+                main.dll
+                settings.txt      (auto-generated on first run)
+                music/            (race BGM)
+                music_lobby/      (lobby BGM)
+                music_title/      (title screen BGM)
+              enabled.txt
 ```
 
 3. Drop your audio files into the appropriate folder(s).
@@ -76,7 +78,7 @@ Each line: `filename : weight, volumeMul`
 
 ## Settings
 
-A `settings.txt` file is auto-generated next to `main.dll` after you first adjust volume. You can also create it manually:
+A `settings.txt` file is auto-generated inside `dlls/` after you first adjust volume. You can also create it manually:
 
 ```
 //Play another music file after one is finished instead of looping? true or false
